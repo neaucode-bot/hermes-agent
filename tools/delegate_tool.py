@@ -36,7 +36,18 @@ from toolsets import TOOLSETS
 # not natively known (named custom providers, third-party aggregators, etc.).
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
+
+# Workspace pinned on delegated leaves that run natively on the cursor-openai-api
+# proxy. The canonical `.code-workspace` declares both roots with the git repo
+# (cursor-openai-api) FIRST so it is the SDK's primary/git root, then ~/.hermes;
+# the proxy expands it so the native Cursor agent indexes both. Overridable via
+# env for non-default machines/profiles.
+_CURSOR_NATIVE_WORKSPACE = os.environ.get(
+    "HERMES_CURSOR_NATIVE_CWD",
+    "/Users/jarvis/hermes-cursor-symbiosis.code-workspace",
+)
 from tools import file_state
+from tools.subagent_handoff import consume_delegate_handoff
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
 
@@ -977,6 +988,8 @@ def _build_child_agent(
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Per-task reasoning effort override (beats delegation.reasoning_effort).
+    override_reasoning_effort: Optional[str] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1152,21 +1165,24 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: per-task override > delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
-        delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
-        if delegation_effort:
-            from hermes_constants import parse_reasoning_effort
+        from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
+        effort_source = (
+            str(override_reasoning_effort or "").strip()
+            or str(delegation_cfg.get("reasoning_effort") or "").strip()
+        )
+        if effort_source:
+            parsed = parse_reasoning_effort(effort_source)
             if parsed is not None:
                 child_reasoning = parsed
             else:
                 logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
+                    "Unknown delegation reasoning_effort '%s', inheriting parent level",
+                    effort_source,
                 )
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
@@ -1231,6 +1247,41 @@ def _build_child_agent(
         iteration_budget=None,  # fresh budget per subagent
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+
+    # ── Cursor proxy: native tool mode for delegated leaves ──────────────
+    # The orchestrator talks to the cursor-openai-api proxy in *client* mode
+    # (Hermes marker-protocol tools). A delegated leaf should instead drive
+    # Cursor's own SDK tools, so flip it to *native*. We detect "this child
+    # targets the cursor proxy" structurally — the provider config injects a
+    # ``cursor_tool_mode`` marker into request_overrides.extra_body only for
+    # that base_url (see providers.<cursor>.extra_body) — so no hard-coded URL
+    # is needed and non-Cursor custom endpoints (Ollama, vLLM) are untouched.
+    # cursor_tool_mode / cursor_cwd are sent as top-level request body fields,
+    # which the proxy reads with the highest precedence (see tool-mode.ts /
+    # workspace.ts: request field > metadata > header > server default).
+    try:
+        _ro = dict(getattr(child, "request_overrides", {}) or {})
+        _eb = dict(_ro.get("extra_body") or {})
+        if "cursor_tool_mode" in _eb:
+            _eb["cursor_tool_mode"] = "native"
+            _eb.setdefault("cursor_cwd", _CURSOR_NATIVE_WORKSPACE)
+            # Defense-in-depth: force tool_choice="none" so the proxy can never
+            # fall back into a client marker-protocol loop for this leaf. Native
+            # SDK tools are not OpenAI `tools` and are unaffected (proxy:
+            # resolveClientToolLoopEnabled returns false for native regardless),
+            # but if mode resolution ever degraded to auto/client, isClientToolLoop
+            # short-circuits on tool_choice=="none" (client-tools/request.ts).
+            _eb["tool_choice"] = "none"
+            _ro["extra_body"] = _eb
+            child.request_overrides = _ro
+            child._cursor_native_leaf = True
+            logger.debug(
+                "[subagent-%s] cursor native mode: extra_body=%s",
+                task_index, _eb,
+            )
+    except Exception as exc:
+        logger.debug("cursor native-mode override skipped: %s", exc)
+
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -1744,6 +1795,15 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
 
         summary = result.get("final_response") or ""
+        if getattr(child, "_cursor_native_leaf", False) and summary:
+            cursor_meta = getattr(child, "_last_cursor_meta", None)
+            clean_summary, handoff_payload = consume_delegate_handoff(
+                summary, cursor_meta
+            )
+            summary = clean_summary or summary
+        else:
+            handoff_payload = None
+
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
@@ -1842,6 +1902,8 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        if handoff_payload:
+            entry["handoff"] = handoff_payload
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
@@ -2046,6 +2108,8 @@ def delegate_task(
     context: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
@@ -2158,7 +2222,14 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "role": top_role,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2199,12 +2270,18 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            task_model = (
+                str(t.get("model") or model or creds.get("model") or "").strip() or None
+            )
+            task_effort = (
+                str(t.get("reasoning_effort") or reasoning_effort or "").strip() or None
+            )
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=task_model,
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
@@ -2220,6 +2297,7 @@ def delegate_task(
                     if task_acp_args is not None
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
+                override_reasoning_effort=task_effort,
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -2856,6 +2934,12 @@ def _build_top_level_description() -> str:
         "subagent to return a verifiable handle (URL, ID, absolute path, HTTP "
         "status) and verify it yourself — fetch the URL, stat the file, read "
         "back the content — before telling the user the operation succeeded.\n"
+        "- Native Cursor leaf results include a structured `handoff` object "
+        "(status, summary, artifacts, recommended_next) separate from the "
+        "prose `summary`. Use the structured fields for routing; never paste "
+        "raw ```handoff JSON fences into user-facing messages (Telegram, etc.). "
+        "When you must mention the contract, use inline backticks or the word "
+        "handoff — not a live fenced code block.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
         "delegate_task, clarify, memory, send_message, execute_code.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
@@ -2865,7 +2949,10 @@ def _build_top_level_description() -> str:
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
-        "- Results are always returned as an array, one entry per task."
+        "- Results are always returned as an array, one entry per task.\n"
+        "- Per-task `model` and `reasoning_effort` override the parent and "
+        "delegation config for that child only (e.g. route coding to Opus high "
+        "while the parent stays on Auto)."
     )
 
 
@@ -2988,6 +3075,22 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model id for the subagent (single-task mode). "
+                    "Overrides delegation.model and parent model. Examples: "
+                    "'default' (Auto), 'composer-2.5', 'claude-opus-4-8'."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "description": (
+                    "Optional reasoning/thinking effort for the subagent "
+                    "(single-task mode). Examples: 'low', 'medium', 'high', "
+                    "'xhigh'. Overrides delegation.reasoning_effort."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3020,6 +3123,20 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Per-task model id. Overrides parent and "
+                                "delegation.model for this task only."
+                            ),
+                        },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "description": (
+                                "Per-task reasoning effort (low/medium/high/xhigh). "
+                                "Overrides delegation.reasoning_effort for this task."
+                            ),
                         },
                     },
                     "required": ["goal"],

@@ -555,6 +555,41 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertIn("result_bytes", entry["tool_trace"][0])
             self.assertEqual(entry["tool_trace"][0]["status"], "ok")
 
+    def test_cursor_native_handoff_stripped_from_summary(self):
+        """Native Cursor leaves: prose summary has no ```handoff fence; structured fields exposed."""
+        from tools.delegate_tool import _run_single_child
+
+        handoff_json = {
+            "schema_version": "1.0",
+            "status": "done",
+            "summary": "Implemented feature.",
+            "artifacts": [],
+        }
+        fence = "```handoff\n" + json.dumps(handoff_json) + "\n```"
+        raw_summary = "Worker narrative.\n\n" + fence
+
+        mock_child = MagicMock()
+        mock_child.model = "claude-opus-4-8"
+        mock_child.session_prompt_tokens = 100
+        mock_child.session_completion_tokens = 50
+        mock_child._cursor_native_leaf = True
+        mock_child._last_cursor_meta = {"handoff": handoff_json}
+        mock_child.run_conversation.return_value = {
+            "final_response": raw_summary,
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        entry = _run_single_child(0, "Native leaf task", child=mock_child, parent_agent=_make_mock_parent())
+
+        self.assertEqual(entry["summary"], "Worker narrative.")
+        self.assertNotIn("```handoff", entry["summary"])
+        self.assertIn("handoff", entry)
+        self.assertEqual(entry["handoff"]["status"], "done")
+        self.assertEqual(entry["handoff"]["summary"], "Implemented feature.")
+
     def test_tool_trace_handles_list_content_blocks(self):
         """Tool-result content blocks should not crash observability metadata."""
         parent = _make_mock_parent(depth=0)
