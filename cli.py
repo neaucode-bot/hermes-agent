@@ -8264,7 +8264,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         which would otherwise early-return before any credits showed.
         """
         if not self.agent:
-            if not self._print_nous_credits_block():
+            printed = self._print_nous_credits_block()
+            printed = self._print_cursor_usage_block() or printed
+            if not printed:
                 print("(._.) No active agent -- send a message first.")
             return
 
@@ -8272,7 +8274,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         calls = agent.session_api_calls
 
         if calls == 0:
-            if not self._print_nous_credits_block():
+            printed = self._print_nous_credits_block()
+            printed = self._print_cursor_usage_block() or printed
+            if not printed:
                 print("(._.) No API calls made yet in this session.")
             return
 
@@ -8370,6 +8374,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Nous credits magnitudes + monthly-grant gauge (agent-independent — also
         # runs at the no-agent / no-calls early-returns above). See the helper.
         self._print_nous_credits_block()
+        self._print_cursor_usage_block()
 
         if self.verbose:
             logging.getLogger().setLevel(logging.DEBUG)
@@ -8400,6 +8405,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         from agent.account_usage import nous_credits_lines
 
         lines = nous_credits_lines()
+        if not lines:
+            return False
+        print()
+        for line in lines:
+            print(f"  {line}")
+        return True
+
+    def _print_cursor_usage_block(self) -> bool:
+        """Print Cursor IDE included-usage percentages when local auth is available.
+
+        Agent-independent: reads Cursor's local auth DB and fetches the dashboard
+        usage-summary API. Shared by CLI, gateway, and TUI /usage surfaces.
+        Fail-open — returns False when Cursor is unavailable or unsigned-in.
+        """
+        from agent.cursor_usage import cursor_usage_lines
+
+        lines = cursor_usage_lines()
         if not lines:
             return False
         print()

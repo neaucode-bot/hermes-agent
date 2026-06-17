@@ -553,12 +553,16 @@ export const sessionCommands: SlashCommand[] = [
         // even with zero API calls or on a resumed session. Render it whenever
         // present, before the token panel.
         const creditsLines = r?.credits_lines ?? []
+        const cursorLines = r?.cursor_lines ?? []
         if (creditsLines.length) {
           ctx.transcript.panel('Nous credits', [{ text: creditsLines.join('\n') }])
         }
+        if (cursorLines.length) {
+          ctx.transcript.panel('Cursor included usage', [{ text: cursorLines.join('\n') }])
+        }
 
         if (!r?.calls) {
-          if (!creditsLines.length) {
+          if (!creditsLines.length && !cursorLines.length) {
             ctx.transcript.sys('no API calls yet')
           }
           return

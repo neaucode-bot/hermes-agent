@@ -3188,6 +3188,14 @@ class GatewaySlashCommandsMixin:
         except Exception:
             credits_lines = []  # fail-open: never break /usage
 
+        cursor_lines: list[str] = []
+        try:
+            from agent.cursor_usage import cursor_usage_lines
+
+            cursor_lines = await asyncio.to_thread(cursor_usage_lines, markdown=True)
+        except Exception:
+            cursor_lines = []  # fail-open: never break /usage
+
         if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
             lines = []
 
@@ -3251,6 +3259,9 @@ class GatewaySlashCommandsMixin:
             if credits_lines:
                 lines.append("")
                 lines.extend(credits_lines)
+            if cursor_lines:
+                lines.append("")
+                lines.extend(cursor_lines)
 
             return "\n".join(lines)
 
@@ -3273,14 +3284,21 @@ class GatewaySlashCommandsMixin:
             if credits_lines:
                 lines.append("")
                 lines.extend(credits_lines)
+            if cursor_lines:
+                lines.append("")
+                lines.extend(cursor_lines)
             return "\n".join(lines)
-        if account_lines or credits_lines:
-            # account-only, credits-only, or both — joined with a blank divider.
+        if account_lines or credits_lines or cursor_lines:
+            # account-only, credits-only, cursor-only, or any combo — joined with blank dividers.
             parts = list(account_lines)
             if credits_lines:
                 if parts:
                     parts.append("")
                 parts.extend(credits_lines)
+            if cursor_lines:
+                if parts:
+                    parts.append("")
+                parts.extend(cursor_lines)
             return "\n".join(parts)
         return t("gateway.usage.no_data")
 

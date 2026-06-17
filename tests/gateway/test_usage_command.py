@@ -256,3 +256,47 @@ class TestUsageAccountSection:
         assert account_call["kwargs"]["base_url"] == "https://chatgpt.com/backend-api/codex"
         assert "📊 **Session Info**" in result
         assert "📈 **Account limits**" in result
+
+
+class TestUsageCursorSection:
+    """Cursor included-usage overlay appended to /usage output."""
+
+    @pytest.mark.asyncio
+    async def test_usage_command_includes_cursor_section(self, monkeypatch):
+        agent = _make_mock_agent()
+        runner = _make_runner(SK, cached_agent=agent)
+        event = MagicMock()
+
+        monkeypatch.setattr(
+            "agent.cursor_usage.cursor_usage_lines",
+            lambda markdown=False: [
+                "📊 **Cursor included usage**" if markdown else "📊 Cursor included usage",
+                "Total: 43% used",
+                "API: 10% used",
+            ],
+        )
+        monkeypatch.setattr("agent.account_usage.nous_credits_lines", lambda markdown=False: [])
+
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
+             patch("agent.usage_pricing.estimate_usage_cost") as mock_cost:
+            mock_cost.return_value = MagicMock(amount_usd=None, status="unknown")
+            result = await runner._handle_usage_command(event)
+
+        assert "📊 **Cursor included usage**" in result
+        assert "Total: 43% used" in result
+
+    @pytest.mark.asyncio
+    async def test_usage_command_cursor_only_when_no_agent(self, monkeypatch):
+        runner = _make_runner(SK)
+        event = MagicMock()
+
+        monkeypatch.setattr(
+            "agent.cursor_usage.cursor_usage_lines",
+            lambda markdown=False: ["📊 **Cursor included usage**", "Total: 12% used"],
+        )
+        monkeypatch.setattr("agent.account_usage.nous_credits_lines", lambda markdown=False: [])
+
+        result = await runner._handle_usage_command(event)
+
+        assert "📊 **Cursor included usage**" in result
+        assert "Total: 12% used" in result

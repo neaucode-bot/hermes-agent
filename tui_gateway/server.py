@@ -4956,6 +4956,14 @@ def _(rid, params: dict) -> dict:
             usage["credits_lines"] = credits
     except Exception:
         pass
+    try:
+        from agent.cursor_usage import cursor_usage_lines
+
+        cursor = cursor_usage_lines()
+        if cursor:
+            usage["cursor_lines"] = cursor
+    except Exception:
+        pass
     return _ok(rid, usage)
 
 
