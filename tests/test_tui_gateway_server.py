@@ -3972,6 +3972,43 @@ def test_session_status_reads_live_gateway_agent(monkeypatch):
     assert "Agent Running: Yes" in out
 
 
+def test_get_usage_context_meter_uses_last_prompt_tokens_only():
+    """context_used must reflect live prompt size, not cumulative session spend."""
+    compressor = types.SimpleNamespace(
+        last_prompt_tokens=0,
+        context_length=200_000,
+        compression_count=0,
+    )
+    agent = types.SimpleNamespace(
+        model="composer-2.5",
+        provider="custom",
+        session_input_tokens=0,
+        session_output_tokens=0,
+        session_cache_read_tokens=0,
+        session_cache_write_tokens=0,
+        session_prompt_tokens=0,
+        session_completion_tokens=0,
+        session_total_tokens=355_000,
+        session_api_calls=40,
+        context_compressor=compressor,
+    )
+
+    usage = server._get_usage(agent)
+
+    assert usage["context_used"] == 0
+    assert usage["context_max"] == 200_000
+    assert usage["total"] == 355_000
+
+    compressor.last_prompt_tokens = 82_500
+    usage = server._get_usage(agent)
+    assert usage["context_used"] == 82_500
+    assert usage["context_percent"] == 41
+
+    compressor.last_prompt_tokens = -1
+    usage = server._get_usage(agent)
+    assert usage["context_used"] == 0
+
+
 def test_skills_reload_runs_in_gateway_process(monkeypatch):
     import agent.skill_commands as skill_commands
 

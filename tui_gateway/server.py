@@ -2377,7 +2377,13 @@ def _get_usage(agent) -> dict:
     }
     comp = getattr(agent, "context_compressor", None)
     if comp:
-        ctx_used = getattr(comp, "last_prompt_tokens", 0) or usage["total"] or 0
+        # Context meter tracks the live prompt size only — not cumulative
+        # session_total_tokens (billing/history) or preflight rough estimates
+        # parked at the -1 sentinel right after compression.
+        context_tokens = getattr(comp, "last_prompt_tokens", 0) or 0
+        if context_tokens < 0:
+            context_tokens = 0
+        ctx_used = context_tokens
         ctx_max = getattr(comp, "context_length", 0) or 0
         if ctx_max:
             usage["context_used"] = ctx_used
