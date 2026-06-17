@@ -12,6 +12,26 @@ from providers import register_provider
 from providers.base import ProviderProfile
 
 
+def _current_profile_name() -> str | None:
+    """Best-effort: resolve the profile this process is bound to from HERMES_HOME.
+
+    Lets a fully-delegated run (empty Hermes toolset → Cursor SDK with its own
+    tools) record which profile it originated from in the request metadata, so
+    delegated sessions stay attributable even when a bare invocation falls back
+    to the default home (#18594).
+    """
+    try:
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+
+        home = get_hermes_home().resolve()
+        root = get_default_hermes_root().resolve()
+        if home == root:
+            return "default"
+        return home.name or None
+    except Exception:
+        return None
+
+
 class CustomProfile(ProviderProfile):
     """Custom/Ollama local provider — think=false and num_ctx support."""
 
@@ -37,7 +57,21 @@ class CustomProfile(ProviderProfile):
             if _effort == "none" or _enabled is False:
                 extra_body["think"] = False
 
-        return extra_body, {}
+        top_level: dict[str, Any] = {}
+        metadata: dict[str, Any] = {}
+        session_id = (ctx.get("session_id") or "").strip()
+        if session_id:
+            # cursor-openai-api maps metadata.hermes_session_id → stable agent key
+            metadata["hermes_session_id"] = session_id
+        # Tag the originating profile so fully-delegated Cursor runs are
+        # attributable to the profile that launched them.
+        profile = _current_profile_name()
+        if profile:
+            metadata["hermes_profile"] = profile
+        if metadata:
+            top_level["metadata"] = metadata
+
+        return extra_body, top_level
 
     def fetch_models(
         self,

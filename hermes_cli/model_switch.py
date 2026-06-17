@@ -1425,6 +1425,26 @@ def list_authenticated_providers(
             model_ids = curated.get(hermes_id, [])
             if hermes_id in _MODELS_DEV_PREFERRED:
                 model_ids = _merge_with_models_dev(hermes_id, model_ids)
+        # Honor providers.<id>.discover_models: false for built-in rows so
+        # users can pin a subset (e.g. grok-4.3 only) or hide chat models
+        # entirely (models: {}) while keeping XAI_API_KEY for web tools.
+        if user_providers and isinstance(user_providers, dict):
+            ep_cfg = user_providers.get(hermes_id)
+            if isinstance(ep_cfg, dict):
+                discover = ep_cfg.get("discover_models", True)
+                if isinstance(discover, str):
+                    discover = discover.lower() not in {"false", "no", "0"}
+                if not discover:
+                    cfg_models = ep_cfg.get("models", [])
+                    configured: list[str] = []
+                    if isinstance(cfg_models, dict):
+                        configured = [str(m) for m in cfg_models if str(m).strip()]
+                    elif isinstance(cfg_models, list):
+                        configured = [str(m) for m in cfg_models if str(m).strip()]
+                    default_model = ep_cfg.get("default_model", "") or ep_cfg.get("model", "")
+                    if default_model and default_model not in configured:
+                        configured.insert(0, str(default_model))
+                    model_ids = configured
         total = len(model_ids)
         top = model_ids[:max_models]
 

@@ -28,6 +28,16 @@ from typing import Any, Dict, Optional
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
+
+
+def _capture_cursor_meta_from_response(agent, response) -> None:
+    """Best-effort: store proxy ``cursor`` meta (incl. handoff) on the agent."""
+    try:
+        from tools.subagent_handoff import capture_cursor_meta
+
+        capture_cursor_meta(agent, response)
+    except Exception:
+        pass
 from agent.model_metadata import is_local_endpoint
 from agent.message_sanitization import (
     _sanitize_surrogates,
@@ -548,8 +558,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
         raise result["error"]
+    _capture_cursor_meta_from_response(agent, result["response"])
     return result["response"]
-
 
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
@@ -1685,6 +1695,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 raise InterruptedError("Agent interrupted during Bedrock API call")
         if result["error"] is not None:
             raise result["error"]
+        _capture_cursor_meta_from_response(agent, result["response"])
         return result["response"]
 
     result = {"response": None, "error": None, "partial_tool_names": []}
@@ -1857,6 +1868,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
+        cursor_meta_holder: Dict[str, Any] = {}
         for chunk in stream:
             last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
@@ -1881,6 +1893,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             if agent._interrupt_requested:
                 break
+
+            try:
+                from tools.subagent_handoff import extract_cursor_meta_from_response
+
+                _chunk_cursor = extract_cursor_meta_from_response(chunk)
+                if _chunk_cursor:
+                    cursor_meta_holder.clear()
+                    cursor_meta_holder.update(_chunk_cursor)
+            except Exception:
+                pass
 
             if not chunk.choices:
                 if hasattr(chunk, "model") and chunk.model:
@@ -2071,6 +2093,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         #      against.  Route it through the partial-stream-stub path
         #      instead so the loop reports an honest mid-tool-call stream
         #      drop and fails fast rather than escalating output budget.
+        if cursor_meta_holder:
+            agent._last_cursor_meta = dict(cursor_meta_holder)
+
         _tool_args_dropped_no_finish = has_truncated_tool_args and finish_reason is None
         if _tool_args_dropped_no_finish:
             _dropped_names = [
@@ -2665,6 +2690,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _dropped_tool_names=_partial_names or None,
             )
         raise result["error"]
+    _capture_cursor_meta_from_response(agent, result["response"])
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────

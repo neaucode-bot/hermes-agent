@@ -472,6 +472,34 @@ class TestQwenProfile:
         assert "metadata" not in eb
 
 
+class TestCustomProfile:
+    def _patch_profile(self, monkeypatch, value):
+        import sys
+
+        p = get_provider_profile("custom")
+        mod = sys.modules[type(p).__module__]
+        monkeypatch.setattr(mod, "_current_profile_name", lambda: value)
+        return p
+
+    def test_metadata_carries_session_id_and_profile(self, monkeypatch):
+        p = self._patch_profile(monkeypatch, "default")
+        _eb, tl = p.build_api_kwargs_extras(session_id="20260615_abc")
+        assert tl["metadata"] == {
+            "hermes_session_id": "20260615_abc",
+            "hermes_profile": "default",
+        }
+
+    def test_profile_recorded_without_session_id(self, monkeypatch):
+        p = self._patch_profile(monkeypatch, "myprofile")
+        _eb, tl = p.build_api_kwargs_extras()
+        assert tl["metadata"] == {"hermes_profile": "myprofile"}
+
+    def test_no_metadata_when_profile_unresolved(self, monkeypatch):
+        p = self._patch_profile(monkeypatch, None)
+        _eb, tl = p.build_api_kwargs_extras()
+        assert "metadata" not in tl
+
+
 class TestBaseProfile:
     def test_prepare_messages_passthrough(self):
         p = ProviderProfile(name="test")
