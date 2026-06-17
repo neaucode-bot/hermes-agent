@@ -17,6 +17,37 @@ const setModelAssignment = vi.fn()
 const getRecommendedDefaultModel = vi.fn()
 const setEnvVar = vi.fn()
 const startManualProviderOAuth = vi.fn()
+const modelPickerDialog = vi.fn()
+
+vi.mock('@/components/model-picker', () => ({
+  ModelPickerDialog: (props: {
+    open: boolean
+    onOpenChange: (open: boolean) => void
+    onSelect: (selection: { provider: string; model: string; persistGlobal: boolean }) => void
+  }) => {
+    modelPickerDialog(props)
+
+    if (!props.open) {
+      return null
+    }
+
+    return (
+      <div role="dialog">
+        <button
+          onClick={() =>
+            props.onSelect({ provider: 'openrouter', model: 'anthropic/claude-opus-4.7', persistGlobal: true })
+          }
+          type="button"
+        >
+          Pick aux model
+        </button>
+        <button onClick={() => props.onOpenChange(false)} type="button">
+          Close picker
+        </button>
+      </div>
+    )
+  }
+}))
 
 vi.mock('@/hermes', () => ({
   getGlobalModelInfo: () => getGlobalModelInfo(),
@@ -72,11 +103,12 @@ describe('ModelSettings', () => {
     const triggers = await screen.findAllByRole('combobox')
     fireEvent.click(triggers[0])
 
-    // "Nous" shows in both the trigger and the open list; the unconfigured
-    // provider + its setup hint are the unique signal of the full universe.
+    // "Nous" shows in both the trigger and the open list; selecting the
+    // unconfigured api_key provider surfaces its inline activation UI.
     expect((await screen.findAllByText('Nous')).length).toBeGreaterThan(0)
-    expect(await screen.findByText(/DeepSeek/)).toBeTruthy()
-    expect(await screen.findByText(/set up/)).toBeTruthy()
+    const deepseekOption = await screen.findByText(/DeepSeek/)
+    fireEvent.click(deepseekOption)
+    expect(await screen.findByPlaceholderText(/Paste DEEPSEEK_API_KEY/)).toBeTruthy()
   })
 
   it('activates an unconfigured api_key provider inline by saving its key', async () => {
@@ -105,6 +137,33 @@ describe('ModelSettings', () => {
 
     expect(await screen.findByText('Vision')).toBeTruthy()
     expect(screen.getAllByText('auto · use main model').length).toBeGreaterThan(0)
+  })
+
+  it('assigns an auxiliary task via the shared model picker', async () => {
+    await renderModelSettings()
+
+    const changeButtons = await screen.findAllByRole('button', { name: 'Change' })
+    fireEvent.click(changeButtons[0])
+
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    expect(modelPickerDialog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        open: true,
+        currentModel: 'hermes-4',
+        currentProvider: 'nous'
+      })
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick aux model' }))
+
+    await waitFor(() =>
+      expect(setModelAssignment).toHaveBeenCalledWith({
+        model: 'anthropic/claude-opus-4.7',
+        provider: 'openrouter',
+        scope: 'auxiliary',
+        task: 'vision'
+      })
+    )
   })
 
   it('assigns an auxiliary task to the main model via setModelAssignment', async () => {

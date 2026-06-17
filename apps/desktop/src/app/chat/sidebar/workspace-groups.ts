@@ -1,6 +1,8 @@
 import type { HermesWorktreeInfo } from '@/global'
 import type { SessionInfo } from '@/hermes'
 
+import { sessionRecency } from './order'
+
 export interface SidebarSessionGroup {
   id: string
   label: string
@@ -109,11 +111,10 @@ export function workspaceGroupsFor(
 
   if (!options.preserveSessionOrder) {
     // Groups keep recency order (Map insertion = first-seen in the recency-sorted
-    // input, so an active project floats up), but rows *within* a group sort by
-    // creation time so they don't reshuffle every time a message lands — keeps
-    // muscle memory intact.
+    // input, so an active project floats up); rows within a group sort by last
+    // activity too so recently-used sessions surface at the top.
     for (const group of groups.values()) {
-      group.sessions.sort((a, b) => b.started_at - a.started_at)
+      group.sessions.sort((a, b) => sessionRecency(b) - sessionRecency(a))
     }
   }
 
@@ -231,8 +232,8 @@ export function uniqueCwds(sessions: SessionInfo[]): string[] {
 /**
  * Build the `parent → worktree → sessions` tree. Parents keep recency order
  * (first-seen in the recency-sorted input); worktree groups within a parent do
- * too, while rows inside a worktree sort by creation time (stable muscle memory,
- * matching `workspaceGroupsFor`).
+ * too, while rows inside a worktree sort by last activity (matching
+ * `workspaceGroupsFor`).
  */
 export function workspaceTreeFor(
   sessions: SessionInfo[],
@@ -284,7 +285,7 @@ export function workspaceTreeFor(
 
   if (!options.preserveSessionOrder) {
     for (const entry of worktrees.values()) {
-      entry.group.sessions.sort((a, b) => b.started_at - a.started_at)
+      entry.group.sessions.sort((a, b) => sessionRecency(b) - sessionRecency(a))
     }
   }
 

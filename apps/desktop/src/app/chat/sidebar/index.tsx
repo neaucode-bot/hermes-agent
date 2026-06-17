@@ -101,7 +101,7 @@ import type { SidebarNavItem } from '../../types'
 
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarLoadMoreRow } from './load-more-row'
-import { resolveManualSessionOrderIds } from './order'
+import { resolveManualSessionOrderIds, sessionRecency } from './order'
 import { ProfileRail } from './profile-switcher'
 import { SidebarSessionRow } from './session-row'
 import { VirtualSessionList } from './virtual-session-list'
@@ -197,7 +197,6 @@ function ReorderableList({
 }
 
 const countLabel = (loaded: number, total: number) => (total > loaded ? `${loaded}/${total}` : String(loaded))
-const sessionTime = (s: SessionInfo) => s.last_active || s.started_at || 0
 
 function orderByIds<T>(items: T[], getId: (item: T) => string, orderIds: string[]): T[] {
   if (!orderIds.length) {
@@ -415,11 +414,11 @@ export function ChatSidebar({
     [sessions, showAllProfiles, profileScope]
   )
 
-  // Agent session order is pinned to creation time (started_at), NOT activity —
-  // a new message must never float a session to the top. Position only changes
-  // for a brand-new session or an explicit manual drag (agentOrderIds).
+  // Agent sessions sort by last activity (most recent first), matching WebUI and
+  // the backend's order=recent fetch. Manual drag-reorder (agentOrderIds) and
+  // pinned sessions override this for their respective sections.
   const sortedSessions = useMemo(
-    () => [...visibleSessions].sort((a, b) => (b.started_at || 0) - (a.started_at || 0)),
+    () => [...visibleSessions].sort((a, b) => sessionRecency(b) - sessionRecency(a)),
     [visibleSessions]
   )
 
@@ -638,7 +637,7 @@ export function ChatSidebar({
 
     return [...bySource.entries()]
       .map(([sourceId, list]) => {
-        const ordered = [...list].sort((a, b) => sessionTime(b) - sessionTime(a))
+        const ordered = [...list].sort((a, b) => sessionRecency(b) - sessionRecency(a))
         const known = messagingPlatformTotals[sourceId]
         const total = Math.max(ordered.length, known ?? 0)
 
@@ -653,7 +652,7 @@ export function ChatSidebar({
           total
         }
       })
-      .sort((a, b) => sessionTime(b.sessions[0]) - sessionTime(a.sessions[0]))
+      .sort((a, b) => sessionRecency(b.sessions[0]) - sessionRecency(a.sessions[0]))
   }, [messagingSessions, messagingPlatformTotals, messagingTruncated])
 
   // ALL-profiles view: one collapsible group per profile, color on the header
@@ -1228,7 +1227,7 @@ function SidebarSessionsSection({
   const hasGroupedSessions = Boolean(groups?.some(group => group.sessions.length > 0))
   const showEmptyState = forceEmptyState || (!hasGroupedSessions && !hasTreeSessions && sessions.length === 0)
   // The flat recents/pinned list is the only place sessions reorder by hand;
-  // grouped/tree views always sort by creation date and never drag.
+  // grouped/tree views sort by recency and never drag.
   const sessionsDraggable = sortable && !!onReorderSessions
 
   const renderRow = (session: SessionInfo, draggable: boolean) => {
@@ -1250,7 +1249,7 @@ function SidebarSessionsSection({
     )
   }
 
-  // Sessions inside repos/worktrees are date-ordered and static.
+  // Sessions inside repos/worktrees are recency-ordered and static.
   const renderRows = (items: SessionInfo[]) => items.map(session => renderRow(session, false))
 
   const flatVirtualized =

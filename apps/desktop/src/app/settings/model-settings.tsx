@@ -1,5 +1,7 @@
+import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
+import { ModelPickerDialog } from '@/components/model-picker'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -15,7 +17,9 @@ import type { AuxiliaryModelsResponse, ModelOptionProvider, StaleAuxAssignment }
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
+import { $gateway } from '@/store/gateway'
 import { startManualLocalEndpoint, startManualProviderOAuth } from '@/store/onboarding'
+import { $activeSessionId } from '@/store/session'
 
 import { CONTROL_TEXT } from './constants'
 import { ListRow, LoadingState, Pill, SectionHeading } from './primitives'
@@ -98,8 +102,9 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   const [selectedModel, setSelectedModel] = useState('')
   const [auxiliary, setAuxiliary] = useState<AuxiliaryModelsResponse | null>(null)
   const [applying, setApplying] = useState(false)
-  const [editingAuxTask, setEditingAuxTask] = useState<null | string>(null)
-  const [auxDraft, setAuxDraft] = useState<{ model: string; provider: string }>({ model: '', provider: '' })
+  const [auxPickerTask, setAuxPickerTask] = useState<null | string>(null)
+  const gateway = useStore($gateway)
+  const activeSessionId = useStore($activeSessionId)
   // Aux slots reported stale by the backend immediately after a main-model
   // switch (provider differs from the new main). Cleared on next switch/reset.
   const [switchStaleAux, setSwitchStaleAux] = useState<StaleAuxAssignment[]>([])
@@ -155,12 +160,20 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     setApiKeyDraft('')
   }, [selectedProvider])
 
-  const auxDraftProviderModels = useMemo(
-    () => providers.find(provider => provider.slug === auxDraft.provider)?.models ?? [],
-    [auxDraft.provider, providers]
-  )
-
   const auxiliaryTaskLabel = useCallback((key: string) => m.tasks[key]?.label ?? key, [m.tasks])
+
+  const auxPickerCurrent = useMemo(() => {
+    if (!auxPickerTask) {
+      return { model: '', provider: '' }
+    }
+
+    const current = auxiliary?.tasks.find(entry => entry.task === auxPickerTask)
+    const provider =
+      current?.provider && current.provider !== 'auto' ? current.provider : (mainModel?.provider ?? '')
+    const model = current?.model || mainModel?.model || ''
+
+    return { model, provider }
+  }, [auxPickerTask, auxiliary, mainModel])
 
   // Persistent mismatch: any aux slot pinned to a provider different from the
   // current main, regardless of whether the user just switched. Catches the
@@ -288,9 +301,9 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     [mainModel, refresh]
   )
 
-  const applyAuxiliaryDraft = useCallback(
-    async (task: string) => {
-      if (!auxDraft.provider || !auxDraft.model) {
+  const applyAuxiliarySelection = useCallback(
+    async (selection: { model: string; provider: string }) => {
+      if (!auxPickerTask || !selection.provider || !selection.model) {
         return
       }
 
@@ -298,8 +311,13 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       setError('')
 
       try {
-        await setModelAssignment({ model: auxDraft.model, provider: auxDraft.provider, scope: 'auxiliary', task })
-        setEditingAuxTask(null)
+        await setModelAssignment({
+          model: selection.model,
+          provider: selection.provider,
+          scope: 'auxiliary',
+          task: auxPickerTask
+        })
+        setAuxPickerTask(null)
         await refresh()
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err))
@@ -307,21 +325,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         setApplying(false)
       }
     },
-    [auxDraft, refresh]
-  )
-
-  const beginAuxiliaryEdit = useCallback(
-    (task: string) => {
-      const current = auxiliary?.tasks.find(entry => entry.task === task)
-
-      const initialProvider =
-        current?.provider && current.provider !== 'auto' ? current.provider : (mainModel?.provider ?? '')
-
-      const initialModel = current?.model || mainModel?.model || ''
-      setAuxDraft({ provider: initialProvider, model: initialModel })
-      setEditingAuxTask(task)
-    },
-    [auxiliary, mainModel]
+    [auxPickerTask, refresh]
   )
 
   const resetAuxiliaryModels = useCallback(async () => {
@@ -476,77 +480,22 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             const copy = m.tasks[meta.key] ?? { label: meta.key, hint: meta.key }
             const current = auxiliary?.tasks.find(entry => entry.task === meta.key)
             const isAuto = !current || !current.provider || current.provider === 'auto'
-            const isEditing = editingAuxTask === meta.key
-
             return (
               <ListRow
                 action={
-                  !isEditing && (
-                    <div className="flex shrink-0 items-center gap-1.5">
-                      <Button
-                        disabled={!mainModel || applying}
-                        onClick={() => void setAuxiliaryToMain(meta.key)}
-                        size="sm"
-                        variant="text"
-                      >
-                        {m.setToMain}
-                      </Button>
-                      <Button
-                        disabled={!providers.length || applying}
-                        onClick={() => beginAuxiliaryEdit(meta.key)}
-                        size="sm"
-                        variant="textStrong"
-                      >
-                        {m.change}
-                      </Button>
-                    </div>
-                  )
-                }
-                below={
-                  isEditing && (
-                    <div className="mt-2 flex flex-wrap items-center gap-2 pt-1">
-                      <Select
-                        onValueChange={value => setAuxDraft(prev => ({ ...prev, provider: value, model: '' }))}
-                        value={auxDraft.provider}
-                      >
-                        <SelectTrigger className={cn('min-w-32', CONTROL_TEXT)}>
-                          <SelectValue placeholder={m.provider} />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {providerOptions.map(provider => (
-                            <SelectItem key={provider.slug || 'none'} value={provider.slug || 'none'}>
-                              {provider.name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <Select
-                        onValueChange={value => setAuxDraft(prev => ({ ...prev, model: value }))}
-                        value={auxDraft.model}
-                      >
-                        <SelectTrigger className={cn('min-w-48', CONTROL_TEXT)}>
-                          <SelectValue placeholder={m.model} />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {(auxDraftProviderModels.length ? auxDraftProviderModels : []).map(model => (
-                            <SelectItem key={model} value={model}>
-                              {model}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <Button
-                        disabled={!auxDraft.provider || !auxDraft.model || applying}
-                        onClick={() => void applyAuxiliaryDraft(meta.key)}
-                        size="sm"
-                      >
-                        {applying ? m.applying : t.common.apply}
-                      </Button>
-                      <Button onClick={() => setEditingAuxTask(null)} size="sm" variant="ghost">
-                        {t.common.cancel}
-                      </Button>
-                    </div>
-                  )
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <Button
+                      disabled={!mainModel || applying}
+                      onClick={() => void setAuxiliaryToMain(meta.key)}
+                      size="sm"
+                      variant="text"
+                    >
+                      {m.setToMain}
+                    </Button>
+                    <Button disabled={applying} onClick={() => setAuxPickerTask(meta.key)} size="sm" variant="textStrong">
+                      {m.change}
+                    </Button>
+                  </div>
                 }
                 description={
                   <span className="font-mono text-[0.68rem]">
@@ -567,6 +516,20 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
           })}
         </div>
       </section>
+
+      <ModelPickerDialog
+        currentModel={auxPickerCurrent.model}
+        currentProvider={auxPickerCurrent.provider}
+        gw={gateway ?? undefined}
+        onOpenChange={open => {
+          if (!open) {
+            setAuxPickerTask(null)
+          }
+        }}
+        onSelect={selection => void applyAuxiliarySelection(selection)}
+        open={auxPickerTask !== null}
+        sessionId={activeSessionId}
+      />
     </div>
   )
 }
