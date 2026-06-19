@@ -28,7 +28,10 @@ from typing import Any, Dict, Optional
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
-from agent.model_metadata import is_local_endpoint
+from agent.model_metadata import (
+    detect_local_server_type_cached,
+    is_local_endpoint,
+)
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
@@ -101,6 +104,27 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
         return sum(_chars(value) for value in api_payload.values()) // 4
 
     return _chars(api_payload) // 4
+
+
+def _is_detected_local_engine(base_url: Any, api_key: str = "") -> bool:
+    """True only for a *genuine* local inference engine at ``base_url``.
+
+    A bare loopback proxy (e.g. the cursor-openai-api proxy on 127.0.0.1:8080)
+    is loopback-by-address but fronts a REMOTE backend, so it must NOT get the
+    unbounded local-engine treatment.  ``is_local_endpoint`` is a cheap pre-gate
+    that keeps remote cloud URLs from ever being probed; ``detect_local_server_
+    type_cached`` then probes engine-specific endpoints (Ollama /api/tags, LM
+    Studio, vLLM, llama.cpp) and returns ``None`` for a bare proxy.
+
+    Shared by the stale-stream detector and the httpx read-timeout gates so the
+    two conditions can never silently diverge.  ``api_key`` is forwarded so an
+    auth-gated local engine probes with the same credentials as the live stream.
+    """
+    return (
+        bool(base_url)
+        and is_local_endpoint(base_url)
+        and detect_local_server_type_cached(base_url, api_key) is not None
+    )
 
 
 def _is_openai_codex_backend(agent) -> bool:
@@ -1773,7 +1797,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # prefill on large contexts before producing the first token.
             # Auto-increase the httpx read timeout unless the user explicitly
             # overrode HERMES_STREAM_READ_TIMEOUT.
-            if _stream_read_timeout == 120.0 and agent.base_url and is_local_endpoint(agent.base_url):
+            #
+            # Gate on a *detected* local engine, not a loopback address: a
+            # loopback proxy fronting a remote backend (cursor-openai-api) must
+            # not get the unbounded local treatment — it falls through to the
+            # cloud-reasoning branch below, which keeps the socket read timeout
+            # in step with the (finite) stale detector.  See the stale-timeout
+            # block for the full rationale; detect_local_server_type_cached is
+            # memoized to stay off the hot path.
+            if (
+                _stream_read_timeout == 120.0
+                and _is_detected_local_engine(
+                    agent.base_url, getattr(agent, "api_key", "")
+                )
+            ):
                 _stream_read_timeout = _base_timeout
                 logger.debug(
                     "Local provider detected (%s) — stream read timeout raised to %.0fs",
@@ -1787,7 +1824,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             ):
                 # Cloud reasoning models (e.g. Opus) routinely pause mid-stream
                 # for minutes during extended thinking.  The stale-stream
-                # detector is deliberately scaled up to tolerate this (180–300s,
+                # detector is deliberately scaled up to tolerate this (180–900s,
                 # see the stale-timeout block below), but the raw httpx socket
                 # read timeout defaulted to a flat 120s and fired *first* —
                 # tearing down a healthy reasoning stream before the stale
@@ -2512,7 +2549,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
     # for prefill on large contexts.  Disable the stale detector unless
     # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
-    if _stream_stale_timeout_base == 180.0 and agent.base_url and is_local_endpoint(agent.base_url):
+    #
+    # Gate on a *detected* local engine rather than a loopback address: the
+    # cursor-openai-api proxy is loopback-by-address (127.0.0.1) but fronts the
+    # REMOTE Cursor backend, so is_local_endpoint() alone misclassifies it as a
+    # slow local model server and disables the detector — turning a slow-but-
+    # healthy remote call into something indistinguishable from a hang.
+    # detect_local_server_type_cached() probes for engine-specific endpoints
+    # (Ollama /api/tags, LM Studio, vLLM, llama.cpp) and returns None for a bare
+    # proxy, so only a genuine local engine disables the detector; a loopback
+    # proxy falls through to the context-scaled finite timeout below.  We keep
+    # is_local_endpoint() as a cheap pre-gate so remote cloud URLs are never
+    # probed, and the probe result is memoized to stay off the hot path.
+    if (
+        _stream_stale_timeout_base == 180.0
+        and _is_detected_local_engine(
+            agent.base_url, getattr(agent, "api_key", "")
+        )
+    ):
         _stream_stale_timeout = float("inf")
         logger.debug("Local provider detected (%s) — stale stream timeout disabled", agent.base_url)
     else:
@@ -2523,7 +2577,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # spurious RemoteProtocolError ("peer closed connection").
         _est_tokens = estimate_request_context_tokens(api_kwargs)
         if _est_tokens > 100_000:
-            _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
+            # Very large contexts routed through the loopback cursor-openai-api
+            # proxy (cloud reasoning, e.g. Opus) can spend 10+ minutes in
+            # prefill before the first chunk — a healthy ~589s prefill was being
+            # killed by the old 300s ceiling and re-prefilling forever.  Allow
+            # up to 15 min so such a prefill survives with comfortable margin.
+            _stream_stale_timeout = max(_stream_stale_timeout_base, 900.0)
         elif _est_tokens > 50_000:
             _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
         else:
