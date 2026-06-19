@@ -1590,13 +1590,41 @@ def _run_single_child(
                     else _HEARTBEAT_STALE_CYCLES_IDLE
                 )
                 if _stale_count[0] >= stale_limit:
-                    logger.warning(
-                        "Subagent %d appears stale (no progress for %d "
-                        "heartbeat cycles, tool=%s) — stopping heartbeat",
-                        task_index,
-                        _stale_count[0],
-                        child_tool or "<none>",
-                    )
+                    # An *idle* child (no active tool) that hasn't advanced for
+                    # the full idle window is genuinely wedged — nothing will
+                    # move it again — so signal it to stop using the same
+                    # interrupt path as the hard-timeout branch below.  Without
+                    # this the monitor only stopped touching the parent and
+                    # relied on the gateway timeout, which never fires for a
+                    # live (non-drain) session, leaving no recovery.
+                    #
+                    # A child sitting *inside* a long-running tool hit the much
+                    # more generous in-tool threshold instead; that may still be
+                    # legitimate work (terminal command, web fetch), so we don't
+                    # interrupt mid-tool — just stop touching the parent and let
+                    # the gateway timeout adjudicate, as before.
+                    if not child_tool:
+                        logger.warning(
+                            "Subagent %d appears stale (no progress for %d "
+                            "heartbeat cycles, idle) — interrupting subagent",
+                            task_index,
+                            _stale_count[0],
+                        )
+                        try:
+                            if hasattr(child, "interrupt"):
+                                child.interrupt()
+                            elif hasattr(child, "_interrupt_requested"):
+                                child._interrupt_requested = True
+                        except Exception:
+                            pass
+                    else:
+                        logger.warning(
+                            "Subagent %d appears stale (no progress for %d "
+                            "heartbeat cycles, tool=%s) — stopping heartbeat",
+                            task_index,
+                            _stale_count[0],
+                            child_tool,
+                        )
                     break  # stop touching parent, let gateway timeout fire
 
                 if child_tool:
@@ -3101,7 +3129,8 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Optional model id for the subagent (single-task mode). "
                     "Overrides delegation.model and parent model. Examples: "
-                    "'default' (Auto), 'composer-2.5', 'claude-opus-4-8'."
+                    "'default' (Auto), 'composer-2.5', 'claude-sonnet-4-6', "
+                    "'claude-opus-4-8', 'gpt-5.4'."
                 ),
             },
             "reasoning_effort": {
@@ -3230,6 +3259,8 @@ registry.register(
         context=args.get("context"),
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
+        model=args.get("model"),
+        reasoning_effort=args.get("reasoning_effort"),
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),

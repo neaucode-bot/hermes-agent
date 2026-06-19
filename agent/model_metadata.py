@@ -599,6 +599,35 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     return None
 
 
+# Memoized results of detect_local_server_type, keyed on normalized base_url.
+# The probe issues up to four blocking HTTP GETs, which is far too expensive to
+# run on the streaming hot path (it would fire once per request).  A given
+# base_url's server identity is effectively static for the process lifetime, so
+# the first probe pays the network cost and every later call is a dict lookup.
+_local_server_type_cache: Dict[str, Optional[str]] = {}
+
+
+def detect_local_server_type_cached(base_url: str, api_key: str = "") -> Optional[str]:
+    """Cached wrapper around :func:`detect_local_server_type`.
+
+    Returns one of ``"ollama"|"lm-studio"|"vllm"|"llamacpp"`` when a real local
+    inference engine is detected at ``base_url``, else ``None`` (e.g. a loopback
+    proxy that merely fronts a remote backend, like the cursor-openai-api proxy,
+    which exposes none of the engine-specific probe endpoints).
+
+    ``None`` results are cached too: a structural non-engine (a proxy) stays a
+    non-engine, and re-probing it on every stream request would defeat the
+    purpose.  This trades a small risk of stale negatives for a momentarily
+    unreachable engine — acceptable, since a down engine isn't streaming anyway.
+    """
+    normalized = _normalize_base_url(base_url) or base_url or ""
+    if normalized in _local_server_type_cache:
+        return _local_server_type_cache[normalized]
+    result = detect_local_server_type(base_url, api_key)
+    _local_server_type_cache[normalized] = result
+    return result
+
+
 def _iter_nested_dicts(value: Any):
     if isinstance(value, dict):
         yield value
