@@ -1,0 +1,15 @@
+---
+description: Any agent in this workspace defers to the Hermes control plane (~/.hermes).
+alwaysApply: true
+---
+
+# Defer to Hermes
+
+This workspace is a running Hermes control plane. However you were spawned, read and obey, in order, before acting:
+
+- `~/.hermes/SOUL.md`
+- `~/.hermes/.cursorrules` + `~/.hermes/AGENTS.md`
+- `~/.hermes/jarvis-diary/AGENTS.md`
+- the current repo's own `AGENTS.md`
+
+These are authoritative. Do not duplicate their logic here.

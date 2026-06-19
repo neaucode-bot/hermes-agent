@@ -97,7 +97,10 @@ models-dev-upstream/
 
 # Local editor / agent tooling (machine-specific; keep in global config, not the repo)
 .codex/
-.cursor/
+.cursor/*
+!.cursor/rules/
+.cursor/rules/*
+!.cursor/rules/hermes-symbiosis-steer.mdc
 .gemini/
 .zed/
 .mcp.json
