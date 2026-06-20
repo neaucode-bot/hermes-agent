@@ -60,6 +60,7 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -178,6 +179,154 @@ def _direct_tools() -> dict[str, tuple[str, Any]]:
     }
 
 
+def _redact_tool_output(result: Any) -> Any:
+    """Scrub secrets from a tool-result string before it leaves this process.
+
+    The normal Hermes agent loop runs every tool result through
+    ``redact_sensitive_text`` before the model (or anything downstream) sees
+    it. The MCP server returns results straight over the wire to the calling
+    Cursor/Codex agent, so we apply the same scrubber here to preserve that
+    guarantee. ``redact_sensitive_text`` honours ``HERMES_REDACT_SECRETS``
+    (defaulted to ``true`` in ``main()``) and is a cheap no-op on non-matching
+    text, so this is safe for every exposed tool. Fail-open if the redactor
+    can't be imported — never block a tool result on the scrubber.
+    """
+    if not isinstance(result, str):
+        return result
+    try:
+        from agent.redact import redact_sensitive_text
+        return redact_sensitive_text(result)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("output redaction unavailable: %s", exc)
+        return result
+
+
+def _guarded_direct_dispatch(tool_name: str, terminal_fn: Any) -> Any:
+    """Wrap a stateless direct-dispatch terminal call so it runs through the
+    same protective middleware the normal ``model_tools.handle_function_call()``
+    path applies — tool_request middleware, the pre_tool_call block hook, ACP
+    edit approval, tool_execution middleware, the post_tool_call observer hook,
+    and the transform_tool_result seam — WITHOUT reintroducing the
+    ``_AGENT_LOOP_TOOLS`` guard that makes these tools uncallable statelessly.
+
+    This matters most for ``send_message``, which has an external side-effect:
+    it actually delivers a message to the user over Telegram/Slack/etc. The
+    bare direct-dispatch path skipped all of these protections. Output
+    redaction is applied once, centrally, by the shared ``_register`` dispatch
+    wrapper, so it is intentionally not repeated here.
+
+    Every protective step fails open (logs + continues) so a missing optional
+    subsystem can never make an otherwise-valid orchestration call unusable —
+    the terminal tool still runs.
+    """
+
+    def _run(args: dict[str, Any]) -> str:
+        args = args or {}
+        original_args = dict(args)
+        middleware_trace: list[dict[str, Any]] = []
+
+        # 1. tool_request middleware — may rewrite args before anything sees them.
+        try:
+            from hermes_cli.middleware import apply_tool_request_middleware
+            mw = apply_tool_request_middleware(tool_name, args)
+            if isinstance(mw.payload, dict):
+                args = mw.payload
+            original_args = mw.original_payload
+            middleware_trace = mw.trace
+        except Exception as exc:
+            logger.debug("tool_request middleware error for %s: %s", tool_name, exc)
+
+        # 2. pre_tool_call block hook — a plugin may veto the call.
+        block_message: Optional[str] = None
+        try:
+            from hermes_cli.plugins import get_pre_tool_call_block_message
+            block_message = get_pre_tool_call_block_message(
+                tool_name, args, middleware_trace=list(middleware_trace),
+            )
+        except Exception as exc:
+            logger.debug("pre_tool_call hook error for %s: %s", tool_name, exc)
+        if block_message is not None:
+            result = json.dumps({"error": block_message}, ensure_ascii=False)
+            try:
+                from model_tools import _emit_post_tool_call_hook
+                _emit_post_tool_call_hook(
+                    function_name=tool_name,
+                    function_args=args,
+                    result=result,
+                    status="blocked",
+                    error_type="plugin_block",
+                    error_message=block_message,
+                    middleware_trace=list(middleware_trace),
+                )
+            except Exception as exc:
+                logger.debug("post_tool_call hook error for %s: %s", tool_name, exc)
+            return result
+
+        # 3. ACP/Zed edit approval — a no-op for these non-file tools, but kept
+        #    so the path mirrors handle_function_call() exactly.
+        try:
+            from acp_adapter.edit_approval import maybe_require_edit_approval
+            edit_block_message = maybe_require_edit_approval(tool_name, args)
+            if edit_block_message is not None:
+                return edit_block_message
+        except Exception as exc:
+            logger.debug("edit approval guard error for %s: %s", tool_name, exc)
+
+        # 4. tool_execution middleware wrapping the terminal direct call.
+        dispatch_start = time.monotonic()
+        try:
+            from hermes_cli.middleware import run_tool_execution_middleware
+            result = run_tool_execution_middleware(
+                tool_name,
+                args,
+                lambda next_args: terminal_fn(
+                    next_args if isinstance(next_args, dict) else args
+                ),
+                original_args=original_args,
+            )
+        except Exception as exc:
+            # If the execution-middleware machinery itself is unavailable, fall
+            # back to the bare terminal call so the tool still works.
+            logger.debug("tool_execution middleware error for %s: %s", tool_name, exc)
+            result = terminal_fn(args)
+        duration_ms = int((time.monotonic() - dispatch_start) * 1000)
+
+        # 5. post_tool_call observer hook.
+        try:
+            from model_tools import _emit_post_tool_call_hook
+            _emit_post_tool_call_hook(
+                function_name=tool_name,
+                function_args=args,
+                result=result,
+                duration_ms=duration_ms,
+                middleware_trace=list(middleware_trace),
+            )
+        except Exception as exc:
+            logger.debug("post_tool_call hook error for %s: %s", tool_name, exc)
+
+        # 6. transform_tool_result seam — plugins may canonicalize the result.
+        try:
+            from hermes_cli.plugins import has_hook, invoke_hook
+            if has_hook("transform_tool_result"):
+                hook_results = invoke_hook(
+                    "transform_tool_result",
+                    tool_name=tool_name,
+                    args=args,
+                    result=result,
+                    duration_ms=duration_ms,
+                )
+                for hook_result in hook_results:
+                    if isinstance(hook_result, str):
+                        result = hook_result
+                        break
+        except Exception as exc:
+            logger.debug("transform_tool_result hook error for %s: %s", tool_name, exc)
+
+        return result
+
+    return _run
+
+
 def _build_server() -> Any:
     """Create the FastMCP server with Hermes tools attached. Lazy imports
     so the module can be imported without the mcp package installed
@@ -228,7 +377,9 @@ def _build_server() -> Any:
                 # tool sees its actual parameters.
                 if set(args) == {"kwargs"} and isinstance(args["kwargs"], dict):
                     args = args["kwargs"]
-                return dispatch_fn(args)
+                # Scrub secrets from every tool result before it leaves the
+                # process, matching the agent loop's redaction guarantee.
+                return _redact_tool_output(dispatch_fn(args))
             except Exception as exc:
                 logger.exception("tool %s raised", tool_name)
                 return json.dumps({"error": str(exc), "tool": tool_name})
@@ -261,11 +412,17 @@ def _build_server() -> Any:
         exposed_count += 1
 
     # Direct-dispatch orchestration tools (send_message, memory,
-    # session_search) — these bypass the stateless handle_function_call()
-    # guard that would otherwise refuse them. See _direct_tools().
+    # session_search). These bypass the stateless handle_function_call()
+    # registry guard that would otherwise refuse them (see _direct_tools()),
+    # but we still route each one through _guarded_direct_dispatch() so it gets
+    # the same protective middleware the normal path applies — tool_request
+    # middleware, pre/post plugin hooks, edit approval, and the
+    # transform_tool_result seam. Output redaction is added by _register's
+    # _dispatch wrapper. This is essential for send_message, which produces an
+    # external side-effect.
     direct_count = 0
     for name, (description, handler) in _direct_tools().items():
-        _register(name, description, handler)
+        _register(name, description, _guarded_direct_dispatch(name, handler))
         direct_count += 1
 
     logger.info(
