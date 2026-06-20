@@ -1003,6 +1003,11 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Per-task working directory for a native cursor-proxy leaf. Threaded into
+    # extra_body.cursor_cwd so the proxy runs the Cursor SDK agent at this repo's
+    # root (loading that repo's .cursor/rules + AGENTS.md). Defaults to
+    # _CURSOR_NATIVE_WORKSPACE when unset. Ignored for non-cursor children.
+    cwd: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1082,7 +1087,12 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    # When a per-task cwd is given (native leaf), the prose hint must name the
+    # same path the proxy actually runs the agent at (cursor_cwd below), so the
+    # worker isn't told a different workspace than the one whose contract loads.
+    workspace_hint = (
+        cwd if (cwd and str(cwd).strip()) else _resolve_workspace_hint(parent_agent)
+    )
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1265,15 +1275,23 @@ def _build_child_agent(
     # ``cursor_tool_mode`` marker into request_overrides.extra_body only for
     # that base_url (see providers.<cursor>.extra_body) — so no hard-coded URL
     # is needed and non-Cursor custom endpoints (Ollama, vLLM) are untouched.
-    # cursor_tool_mode / cursor_cwd are sent as top-level request body fields,
-    # which the proxy reads with the highest precedence (see tool-mode.ts /
-    # workspace.ts: request field > metadata > header > server default).
+    # cursor_tool_mode / cursor_cwd are sent as top-level request body fields.
+    # The proxy reads them off the request in src/agent-turn.ts
+    # (resolveLocalAgentScope): when cursor_tool_mode === "native" it sets
+    # settingSources:["project"] and uses cursor_cwd as the agent cwd if it
+    # resolves under CURSOR_CWD_ALLOWLIST (else falls back to CURSOR_CWD + warns).
+    # The per-task `cwd` lets the orchestrator point a leaf at the specific repo
+    # whose contract (.cursor/rules + AGENTS.md) it should load.
     try:
         _ro = dict(getattr(child, "request_overrides", {}) or {})
         _eb = dict(_ro.get("extra_body") or {})
         if "cursor_tool_mode" in _eb:
             _eb["cursor_tool_mode"] = "native"
-            _eb.setdefault("cursor_cwd", _CURSOR_NATIVE_WORKSPACE)
+            _eb["cursor_cwd"] = (
+                (cwd if (cwd and str(cwd).strip()) else None)
+                or _eb.get("cursor_cwd")
+                or _CURSOR_NATIVE_WORKSPACE
+            )
             # Defense-in-depth: force tool_choice="none" so the proxy can never
             # fall back into a client marker-protocol loop for this leaf. Native
             # SDK tools are not OpenAI `tools` and are unaffected (proxy:
@@ -2164,6 +2182,7 @@ def delegate_task(
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    cwd: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2278,6 +2297,7 @@ def delegate_task(
                 "role": top_role,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
+                "cwd": cwd,
             }
         ]
     else:
@@ -2348,6 +2368,7 @@ def delegate_task(
                 ),
                 override_reasoning_effort=task_effort,
                 role=effective_role,
+                cwd=(str(t.get("cwd") or cwd or "").strip() or None),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -3141,6 +3162,18 @@ DELEGATE_TASK_SCHEMA = {
                     "'xhigh'. Overrides delegation.reasoning_effort."
                 ),
             },
+            "cwd": {
+                "type": "string",
+                "description": (
+                    "Absolute repo/workspace path the subagent should work in "
+                    "(single-task mode). For Cursor-backed native leaves this "
+                    "sets the working directory so the worker loads THAT repo's "
+                    "contract (.cursor/rules + AGENTS.md). Pass the Hermes root "
+                    "for Hermes-functionality work, or the specific repo path "
+                    "for repo-scoped work. Must be allowlisted on the proxy; "
+                    "otherwise it safely falls back to the default workspace."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3186,6 +3219,17 @@ DELEGATE_TASK_SCHEMA = {
                             "description": (
                                 "Per-task reasoning effort (low/medium/high/xhigh). "
                                 "Overrides delegation.reasoning_effort for this task."
+                            ),
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": (
+                                "Per-task absolute repo/workspace path. For "
+                                "Cursor-backed native leaves, the worker runs "
+                                "here and loads that repo's contract "
+                                "(.cursor/rules + AGENTS.md). Must be "
+                                "allowlisted on the proxy; otherwise falls back "
+                                "to the default workspace."
                             ),
                         },
                     },
@@ -3266,6 +3310,7 @@ registry.register(
         acp_args=args.get("acp_args"),
         role=args.get("role"),
         background=args.get("background"),
+        cwd=args.get("cwd"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
