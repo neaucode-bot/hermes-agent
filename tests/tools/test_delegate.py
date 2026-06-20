@@ -2090,6 +2090,47 @@ class TestDispatchDelegateTask(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_cwd_forwarded_to_build_child_agent(self, mock_creds, mock_cfg):
+        """Top-level and per-task cwd reach _build_child_agent."""
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        def _mk_child():
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True,
+                "api_calls": 1, "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "test"
+            return mock_child
+
+        # Single-task: top-level cwd forwarded.
+        with patch("tools.delegate_tool._build_child_agent") as mock_build:
+            mock_build.return_value = _mk_child()
+            delegate_task(goal="t", cwd="/Users/jarvis/.hermes", parent_agent=parent)
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["cwd"], "/Users/jarvis/.hermes")
+
+        # Per-task cwd overrides the top-level one.
+        with patch("tools.delegate_tool._build_child_agent") as mock_build:
+            mock_build.return_value = _mk_child()
+            delegate_task(
+                tasks=[{"goal": "t", "cwd": "/Users/jarvis/code/hermes-webui"}],
+                cwd="/Users/jarvis/.hermes",
+                parent_agent=parent,
+            )
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["cwd"], "/Users/jarvis/code/hermes-webui")
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_model_and_reasoning_effort_forwarded_to_build_child_agent(
         self, mock_creds, mock_cfg,
     ):
