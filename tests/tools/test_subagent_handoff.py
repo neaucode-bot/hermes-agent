@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 
 from tools.subagent_handoff import (
+    PROSE_ONLY_NOTE,
     consume_delegate_handoff,
     extract_cursor_meta_from_response,
     extract_handoff_block,
@@ -42,11 +43,37 @@ class TestSubagentHandoff(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["report"]["status"], "done")
 
-    def test_parse_no_fence_degrades(self):
-        result = parse_handoff("prose only")
+    def test_parse_prose_only_is_done_not_failure(self):
+        # A leaf that answered in prose but skipped the fence should read as a
+        # completed answer carrying that prose, not an alarming partial/failure.
+        result = parse_handoff("Here are my instructions: be helpful.")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["report"]["status"], "done")
+        self.assertEqual(
+            result["report"]["summary"], "Here are my instructions: be helpful."
+        )
+        # Low-severity signal is preserved, but no alarming unresolved item.
+        self.assertTrue(result["report"].get("_degraded"))
+        self.assertIn(PROSE_ONLY_NOTE, result["report"].get("_warnings", []))
+        self.assertNotIn("unresolved", result["report"])
+
+    def test_parse_empty_output_degrades(self):
+        # Genuinely empty output keeps the partial/failure framing.
+        result = parse_handoff("")
         self.assertFalse(result["ok"])
         self.assertEqual(result["report"]["status"], "partial")
         self.assertTrue(result["report"].get("_degraded"))
+        self.assertTrue(result["report"].get("unresolved"))
+
+    def test_consume_prose_only_presents_clean_summary(self):
+        raw = "Worker answered in prose with no fence."
+        clean, payload = consume_delegate_handoff(raw, None)
+        self.assertEqual(clean, raw)
+        self.assertEqual(payload["status"], "done")
+        self.assertEqual(payload["summary"], raw)
+        self.assertTrue(payload.get("degraded"))
+        self.assertIn(PROSE_ONLY_NOTE, payload.get("warnings", []))
+        self.assertNotIn("unresolved", payload)
 
     def test_consume_prefers_cursor_meta(self):
         raw = "Worker narrative.\n\n" + _fence(_MINIMAL)
