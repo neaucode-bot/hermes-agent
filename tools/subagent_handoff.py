@@ -47,6 +47,40 @@ def _major_version(version: str) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
+# Low-severity note attached to prose-only results. Kept as a signal (the
+# leaf skipped the structured contract) without framing a completed answer as
+# a failure.
+PROSE_ONLY_NOTE = "leaf returned prose without a structured handoff block"
+
+
+def _synthesize_prose_only(final_text: str, reason: str) -> HandoffParseResult:
+    """A leaf that answered in prose but skipped the ```handoff fence.
+
+    The native Cursor leaf path has no instruction wiring to emit the fence
+    (the proxy neither injects the contract nor populates ``cursor.handoff``),
+    so a plain leaf reliably returns prose only. When that prose is non-empty
+    the leaf did produce a usable answer, so we carry it as a ``done`` handoff
+    with a low-severity warning instead of an alarming ``partial``/failed
+    result with an unresolved item.
+    """
+    trimmed = (final_text or "").strip()
+    report = {
+        "schema_version": HANDOFF_SCHEMA_VERSION,
+        "status": "done",
+        "summary": trimmed,
+        "artifacts": [],
+        "_degraded": True,
+        "_warnings": [PROSE_ONLY_NOTE],
+    }
+    return {
+        "ok": True,
+        "report": report,
+        "warnings": [PROSE_ONLY_NOTE],
+        "degraded": True,
+        "reason": reason,
+    }
+
+
 def _synthesize_degraded(final_text: str, reason: str) -> HandoffParseResult:
     trimmed = (final_text or "").strip()
     report = {
@@ -75,6 +109,12 @@ def _synthesize_degraded(final_text: str, reason: str) -> HandoffParseResult:
 def parse_handoff(final_text: str) -> HandoffParseResult:
     block = extract_handoff_block(final_text or "")
     if block is None:
+        # No fence at all. If the leaf still produced prose, treat it as a
+        # completed answer (the common native-leaf case) rather than a failure.
+        if (final_text or "").strip():
+            return _synthesize_prose_only(
+                final_text, "no handoff block found in final text"
+            )
         return _synthesize_degraded(final_text, "no handoff block found in final text")
 
     try:

@@ -44,7 +44,7 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 # env for non-default machines/profiles.
 _CURSOR_NATIVE_WORKSPACE = os.environ.get(
     "HERMES_CURSOR_NATIVE_CWD",
-    "/Users/jarvis/hermes-cursor-symbiosis.code-workspace",
+    "/Users/jarvis/.hermes",
 )
 from tools import file_state
 from tools.subagent_handoff import consume_delegate_handoff
@@ -544,6 +544,34 @@ def _get_inherit_mcp_toolsets() -> bool:
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
 
 
+def _get_child_prelude() -> str:
+    """Operator-configurable prose appended to every child system prompt.
+
+    Read from ``delegation.child_prelude`` in config.yaml. This is the one
+    channel guaranteed to reach delegated workers: it rides on the child's
+    ephemeral system prompt regardless of cwd, so it survives the native
+    `settingSources` change that stops delegates from loading project
+    `.cursor/rules` off disk.
+
+    The value is a literal string, OR an absolute path to a file whose
+    contents are used (lets long preludes live outside config.yaml).
+    Returns "" when unset/empty/unreadable so the prompt is unchanged.
+    """
+    cfg = _load_config()
+    raw = cfg.get("child_prelude")
+    if not raw or not str(raw).strip():
+        return ""
+    text = str(raw).strip()
+    try:
+        candidate = os.path.abspath(os.path.expanduser(text))
+        if os.path.isfile(candidate):
+            with open(candidate, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+    except Exception as exc:  # noqa: BLE001 - best-effort; fall back to literal
+        logger.debug("delegation.child_prelude file read failed (%s); using literal", exc)
+    return text
+
+
 def _is_mcp_toolset_name(name: str) -> bool:
     """Return True for canonical MCP toolsets and their registered aliases."""
     if not name:
@@ -706,6 +734,9 @@ def _build_child_system_prompt(
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
+    prelude = _get_child_prelude()
+    if prelude:
+        parts.append(f"\n{prelude}")
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
