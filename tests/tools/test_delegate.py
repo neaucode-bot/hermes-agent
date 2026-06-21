@@ -2636,6 +2636,24 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         )
         self.assertIn("can themselves be orchestrators", prompt)
 
+    def test_leaf_prompt_includes_worker_housekeeping_footer(self):
+        """Leaf workers get the housekeeping footer: no hermes-tools MCP, load
+        skills via Read, brain ops via `hermes -z` — never `skill_view`."""
+        prompt = _build_child_system_prompt("Fix tests", role="leaf")
+        self.assertIn("Worker housekeeping", prompt)
+        self.assertIn("hermes -z", prompt)
+        self.assertIn("no `hermes-tools` MCP", prompt)
+        self.assertIn("never `skill_view`", prompt)
+
+    def test_orchestrator_prompt_omits_worker_housekeeping_footer(self):
+        """The footer targets leaf workers (the powerhouse); orchestrator
+        children route and must not receive it."""
+        prompt = _build_child_system_prompt(
+            "Survey", role="orchestrator",
+            max_spawn_depth=2, child_depth=1,
+        )
+        self.assertNotIn("Worker housekeeping", prompt)
+
     # ── Batch mode and intersection ─────────────────────────────────────
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -2946,6 +2964,64 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+class TestOrchestratorRepinFooter(unittest.TestCase):
+    """The top-level orchestrator gets a router re-pin reminder on its results."""
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_top_level_includes_repin_footer(self, mock_run):
+        from tools.delegate_tool import ORCHESTRATOR_REPIN_FOOTER
+
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed",
+            "summary": "Done", "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent(depth=0)
+        result = json.loads(delegate_task(goal="do x", parent_agent=parent))
+        self.assertEqual(result.get("orchestrator_reminder"), ORCHESTRATOR_REPIN_FOOTER)
+
+    @patch("tools.delegate_tool._get_max_spawn_depth", return_value=3)
+    @patch("tools.delegate_tool._run_single_child")
+    def test_nested_orchestrator_omits_footer(self, mock_run, _mock_depth):
+        """A non-top-level parent (depth>0) must not re-pin its intermediate parent."""
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed",
+            "summary": "Done", "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent(depth=1)
+        result = json.loads(delegate_task(goal="do x", parent_agent=parent))
+        self.assertNotIn("orchestrator_reminder", result)
+
+    @patch(
+        "tools.delegate_tool._get_orchestrator_repin_footer_enabled",
+        return_value=False,
+    )
+    @patch("tools.delegate_tool._run_single_child")
+    def test_config_flag_disables_footer(self, mock_run, _mock_flag):
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed",
+            "summary": "Done", "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent(depth=0)
+        result = json.loads(delegate_task(goal="do x", parent_agent=parent))
+        self.assertNotIn("orchestrator_reminder", result)
+
+    def test_repin_footer_flag_getter(self):
+        from tools.delegate_tool import _get_orchestrator_repin_footer_enabled
+
+        with patch("tools.delegate_tool._load_config", return_value={}):
+            self.assertTrue(_get_orchestrator_repin_footer_enabled())
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"orchestrator_repin_footer": False},
+        ):
+            self.assertFalse(_get_orchestrator_repin_footer_enabled())
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"orchestrator_repin_footer": "no"},
+        ):
+            self.assertFalse(_get_orchestrator_repin_footer_enabled())
 
 
 if __name__ == "__main__":

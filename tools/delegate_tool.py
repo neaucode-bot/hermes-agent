@@ -538,6 +538,65 @@ def _get_orchestrator_enabled() -> bool:
     return True
 
 
+# Default re-pin text appended to a top-level delegate_task result so the
+# orchestrator's next turn is reminded to stay a router (synthesize + delegate)
+# rather than drifting into doing the work itself on the main thread.
+ORCHESTRATOR_REPIN_FOOTER = (
+    "[orchestrator reminder: you are the router, not the doer — synthesize this "
+    "result and delegate the next step. Follow jarvis-orchestrator-routing; do "
+    "not read/grep/research on the main thread.]"
+)
+
+
+def _get_orchestrator_repin_footer_enabled() -> bool:
+    """Whether to append the orchestrator re-pin reminder to top-level results.
+
+    Config flag: ``delegation.orchestrator_repin_footer`` (default True). Lets an
+    operator silence the reminder without a code change. Only ever applied at the
+    top level (parent depth 0) — see the depth gate at the delegate_task return.
+    """
+    cfg = _load_config()
+    val = cfg.get("orchestrator_repin_footer", True)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in {"true", "1", "yes", "on"}
+    return True
+
+
+# Housekeeping footer appended to a leaf worker's system prompt. Reinforces the
+# delegated-worker operating reality (see worker-context.ts contract injection):
+# a native leaf has NO hermes-tools MCP, so it loads skills by Reading SKILL.md
+# paths, does diary/file work directly with Write/Edit, and reaches Hermes brain
+# ops that need validation through the `hermes -z` CLI one-shot. Belt-and-suspenders
+# with the proxy injection so non-native children and other engines get it too.
+WORKER_HOUSEKEEPING_FOOTER = (
+    "Worker housekeeping — you are a delegated worker with no `hermes-tools` MCP:\n"
+    "- Load any Hermes skill by READING its `SKILL.md` path with the Read tool "
+    "(never `skill_view`); before non-trivial work, check for a matching skill and follow it.\n"
+    "- Do diary and other file work directly with the Write/Edit tools.\n"
+    "- For Hermes brain ops that need validation (durable memory, validated skill "
+    "creation), shell out to the CLI one-shot: `hermes -z \"<instruction>\"` "
+    "(optionally `hermes -s <skill> -z \"...\"` to preload a skill)."
+)
+
+
+def _get_worker_housekeeping_footer_enabled() -> bool:
+    """Whether to append the worker housekeeping footer to leaf system prompts.
+
+    Config flag: ``delegation.worker_housekeeping_footer`` (default True). Lets an
+    operator silence the footer without a code change. Applied only to leaf
+    workers (the native powerhouse) — orchestrator children route, not execute.
+    """
+    cfg = _load_config()
+    val = cfg.get("worker_housekeeping_footer", True)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in {"true", "1", "yes", "on"}
+    return True
+
+
 def _get_inherit_mcp_toolsets() -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
     cfg = _load_config()
@@ -549,9 +608,9 @@ def _get_child_prelude() -> str:
 
     Read from ``delegation.child_prelude`` in config.yaml. This is the one
     channel guaranteed to reach delegated workers: it rides on the child's
-    ephemeral system prompt regardless of cwd, so it survives the native
-    `settingSources` change that stops delegates from loading project
-    `.cursor/rules` off disk.
+    ephemeral system prompt regardless of cwd, so it survives native leaves'
+    intentional `settingSources:[]` (no disk `.cursor/rules` load — contract
+    reaches workers via `worker-context.ts` injection instead).
 
     The value is a literal string, OR an absolute path to a file whose
     contents are used (lets long preludes live outside config.yaml).
@@ -734,6 +793,8 @@ def _build_child_system_prompt(
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
+    if role == "leaf" and _get_worker_housekeeping_footer_enabled():
+        parts.append(f"\n{WORKER_HOUSEKEEPING_FOOTER}")
     prelude = _get_child_prelude()
     if prelude:
         parts.append(f"\n{prelude}")
@@ -1309,10 +1370,13 @@ def _build_child_agent(
     # cursor_tool_mode / cursor_cwd are sent as top-level request body fields.
     # The proxy reads them off the request in src/agent-turn.ts
     # (resolveLocalAgentScope): when cursor_tool_mode === "native" it sets
-    # settingSources:["project"] and uses cursor_cwd as the agent cwd if it
-    # resolves under CURSOR_CWD_ALLOWLIST (else falls back to CURSOR_CWD + warns).
+    # settingSources:[] (not ["project"]) and uses cursor_cwd as the agent cwd if
+    # it resolves under CURSOR_CWD_ALLOWLIST (else falls back to CURSOR_CWD +
+    # warns). The contract + skill index reach the worker via worker-context.ts
+    # first-send injection (Option 2), not via the SDK project setting source.
     # The per-task `cwd` lets the orchestrator point a leaf at the specific repo
-    # whose contract (.cursor/rules + AGENTS.md) it should load.
+    # tree whose files/shell commands it should operate on — not for loading disk
+    # rules (settingSources stays []).
     try:
         _ro = dict(getattr(child, "request_overrides", {}) or {})
         _eb = dict(_ro.get("extra_body") or {})
@@ -2712,13 +2776,19 @@ def delegate_task(
 
     total_duration = round(time.monotonic() - overall_start, 2)
 
-    return json.dumps(
-        {
-            "results": results,
-            "total_duration_seconds": total_duration,
-        },
-        ensure_ascii=False,
-    )
+    payload: Dict[str, Any] = {
+        "results": results,
+        "total_duration_seconds": total_duration,
+    }
+
+    # Orchestrator re-pin: only the top-level orchestrator (parent depth 0) gets
+    # the router reminder, so nested orchestrator→worker chains don't re-pin
+    # their own intermediate parents. Idempotent — a single regenerated field per
+    # call, never accumulated. Gated by delegation.orchestrator_repin_footer.
+    if depth == 0 and _get_orchestrator_repin_footer_enabled():
+        payload["orchestrator_reminder"] = ORCHESTRATOR_REPIN_FOOTER
+
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _resolve_child_credential_pool(
