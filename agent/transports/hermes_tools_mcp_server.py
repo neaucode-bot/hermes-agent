@@ -18,7 +18,9 @@ Scope (what we expose):
     _get_images / _console / _vision
   - vision_analyze                       — image inspection by vision model
   - image_generate                       — image generation
-  - skill_view, skills_list              — Hermes' skill library
+  - skill_view, skills_list, skill_manage — Hermes' skill library
+    (skill_manage create/edit/patch/delete is stateless: validates +
+    writes ~/.hermes/skills/ on disk, not `_AGENT_LOOP_TOOLS`-gated)
   - text_to_speech                       — TTS
   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
     heartbeat/show/list/create/            handoff (stateless: read env var,
@@ -81,9 +83,18 @@ logger = logging.getLogger(__name__)
 # Orchestration tools that ARE reachable statelessly (send_message, memory,
 # session_search) are wired separately via DIRECT_TOOLS below, because the
 # stateless `handle_function_call()` path refuses them.
-EXPOSED_TOOLS: tuple[str, ...] = (
-    "web_search",
-    "web_extract",
+#
+# HERMES_CURSOR_MODE=1: set by .cursor/mcp.json when launched from the
+# Cursor IDE. Suppresses browser_* tools (Hermes CloakBrowser stack) because
+# Cursor already provides cursor-ide-browser for standard automation; the
+# dual stack adds ~2,000 tok/turn with no benefit for most IDE tasks.
+# CloakBrowser (stealth auth/signup) is still reachable from the Hermes
+# TUI/gateway path where this env var is not set.
+_CURSOR_MODE: bool = os.environ.get("HERMES_CURSOR_MODE", "") == "1"
+
+# Hermes browser_* tools — exposed in gateway/TUI mode, suppressed in
+# Cursor IDE mode (cursor-ide-browser covers that lane).
+_HERMES_BROWSER_TOOLS: tuple[str, ...] = (
     "browser_navigate",
     "browser_click",
     "browser_type",
@@ -94,10 +105,25 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "browser_get_images",
     "browser_console",
     "browser_vision",
+)
+
+EXPOSED_TOOLS: tuple[str, ...] = (
+    "web_search",
+    "web_extract",
+    *(() if _CURSOR_MODE else _HERMES_BROWSER_TOOLS),
     "vision_analyze",
     "image_generate",
     "skill_view",
     "skills_list",
+    # skill_manage — create/edit/patch/delete Hermes skills. Stateless
+    # (file I/O under ~/.hermes/skills/) and NOT in `_AGENT_LOOP_TOOLS`, so
+    # the registry path dispatches it fine; routing it here (rather than via
+    # DIRECT_TOOLS) means handle_function_call() applies the full middleware
+    # stack — tool_request middleware, pre/post plugin hooks, edit approval,
+    # the skill write-approval gate, and transform_tool_result — exactly like
+    # any other registry tool. Lets a Cursor orchestrator manage skills
+    # without shelling into the Hermes venv.
+    "skill_manage",
     "text_to_speech",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
