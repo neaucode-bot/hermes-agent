@@ -565,11 +565,12 @@ def _get_orchestrator_repin_footer_enabled() -> bool:
 
 
 # Housekeeping footer appended to a leaf worker's system prompt. Reinforces the
-# delegated-worker operating reality (see worker-context.ts contract injection):
-# a native leaf has NO hermes-tools MCP, so it loads skills by Reading SKILL.md
-# paths, does diary/file work directly with Write/Edit, and reaches Hermes brain
-# ops that need validation through the `hermes -z` CLI one-shot. Belt-and-suspenders
-# with the proxy injection so non-native children and other engines get it too.
+# delegated-worker operating reality: a native leaf has NO hermes-tools MCP, so it
+# loads skills by Reading SKILL.md paths, does diary/file work directly with
+# Write/Edit, and reaches Hermes brain ops that need validation through the
+# `hermes -z` CLI one-shot. This lean operating note is the ONLY Hermes-side
+# steer added to a leaf prompt — the Hermes contract is an IDE-only artifact and
+# is intentionally NOT injected into proxy worker sessions.
 WORKER_HOUSEKEEPING_FOOTER = (
     "Worker housekeeping — you are a delegated worker with no `hermes-tools` MCP:\n"
     "- Load any Hermes skill by READING its `SKILL.md` path with the Read tool "
@@ -609,8 +610,9 @@ def _get_child_prelude() -> str:
     Read from ``delegation.child_prelude`` in config.yaml. This is the one
     channel guaranteed to reach delegated workers: it rides on the child's
     ephemeral system prompt regardless of cwd, so it survives native leaves'
-    intentional `settingSources:[]` (no disk `.cursor/rules` load — contract
-    reaches workers via `worker-context.ts` injection instead).
+    intentional `settingSources:[]` (no disk `.cursor/rules` load). The Hermes
+    contract is IDE-only and is never injected here; this prelude is only the
+    operator's optional lean steer.
 
     The value is a literal string, OR an absolute path to a file whose
     contents are used (lets long preludes live outside config.yaml).
@@ -1359,9 +1361,9 @@ def _build_child_agent(
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
 
-    # ── Cursor proxy: native tool mode for delegated leaves ──────────────
+    # ── Cursor proxy: native tool mode for delegated LEAVES ONLY ─────────
     # The orchestrator talks to the cursor-openai-api proxy in *client* mode
-    # (Hermes marker-protocol tools). A delegated leaf should instead drive
+    # (Hermes marker-protocol tools). A delegated *leaf* should instead drive
     # Cursor's own SDK tools, so flip it to *native*. We detect "this child
     # targets the cursor proxy" structurally — the provider config injects a
     # ``cursor_tool_mode`` marker into request_overrides.extra_body only for
@@ -1372,15 +1374,23 @@ def _build_child_agent(
     # (resolveLocalAgentScope): when cursor_tool_mode === "native" it sets
     # settingSources:[] (not ["project"]) and uses cursor_cwd as the agent cwd if
     # it resolves under CURSOR_CWD_ALLOWLIST (else falls back to CURSOR_CWD +
-    # warns). The contract + skill index reach the worker via worker-context.ts
-    # first-send injection (Option 2), not via the SDK project setting source.
+    # warns). The Hermes contract is an IDE-only artifact and is intentionally
+    # NOT injected into proxy worker sessions — a native leaf interfaces with
+    # Hermes via the customTools bridge plus the lean WORKER_HOUSEKEEPING_FOOTER,
+    # and gets any needed skill as a task-scoped pointer in `context` it Reads.
     # The per-task `cwd` lets the orchestrator point a leaf at the specific repo
     # tree whose files/shell commands it should operate on — not for loading disk
     # rules (settingSources stays []).
+    #
+    # GATED ON effective_role == "leaf": an *orchestrator* child must stay in
+    # *client* mode so it keeps the Hermes customTools bridge (and therefore
+    # delegate_task) — native mode's settingSources:[] + tool_choice="none" would
+    # strip the bridge and the child could no longer fan out to its own workers.
+    # Only true leaf nodes (the execution powerhouse) are flipped to native.
     try:
         _ro = dict(getattr(child, "request_overrides", {}) or {})
         _eb = dict(_ro.get("extra_body") or {})
-        if "cursor_tool_mode" in _eb:
+        if effective_role == "leaf" and "cursor_tool_mode" in _eb:
             _eb["cursor_tool_mode"] = "native"
             _eb["cursor_cwd"] = (
                 (cwd if (cwd and str(cwd).strip()) else None)
@@ -1397,6 +1407,16 @@ def _build_child_agent(
             _ro["extra_body"] = _eb
             child.request_overrides = _ro
             child._cursor_native_leaf = True
+            # Lean the worker's stable identity tier: a native leaf executes via
+            # Cursor built-ins (tool_choice:"none"), has no `hermes-tools` MCP and
+            # no customTools bridge, so the Hermes-brain tool guidance + skills
+            # index + `skill_view` help pointer reference tools it cannot call.
+            # Trimming them (agent/system_prompt.py honors this flag) keeps the
+            # leaf prompt to a minimal identity + the ephemeral task brief +
+            # WORKER_HOUSEKEEPING_FOOTER (which already explains the Read/Shell/
+            # `hermes -z` paths). The Hermes contract/AGENTS/.cursor-rules are
+            # separately suppressed by skip_context_files=True (IDE-only artifact).
+            child.lean_worker_prompt = True
             logger.debug(
                 "[subagent-%s] cursor native mode: extra_body=%s",
                 task_index, _eb,
@@ -2265,6 +2285,48 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+_PRESORT_MARKER = "Possibly relevant Hermes skills (auto-selected"
+
+
+def _maybe_pack_presort_skills(task_list: List[Dict[str, Any]]) -> None:
+    """Filter skills per delegate via the cheap-model pre-sort and pack them.
+
+    This is the headline doctrine (parity overhaul §E.3): the orchestrator filters
+    the full skills index down to a small, focused, relevant set per worker and
+    packs it into the delegate's task ``context`` as a Tier-2 pointer (the native
+    worker Reads the canonical SKILL.md). Gated off by default
+    (``skills.presort.enabled``); fully best-effort — any failure leaves the task
+    context untouched and never blocks delegation.
+    """
+    try:
+        from agent.skill_presort import delegate_presort_enabled, select_skills
+    except Exception:
+        return
+    if not delegate_presort_enabled():
+        return
+
+    for task in task_list:
+        try:
+            goal = str(task.get("goal") or "").strip()
+            if not goal:
+                continue
+            existing = task.get("context") or ""
+            # Idempotent: don't re-pack if a presort block is already present
+            # (e.g. an orchestrator child re-delegating a packed task).
+            if _PRESORT_MARKER in existing:
+                continue
+            result = select_skills(goal, context=existing or None)
+            if not result:
+                continue
+            block = result.as_context_block(with_skill_view=False)
+            if not block:
+                continue
+            task["context"] = f"{existing}\n\n{block}" if existing.strip() else block
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("delegate_task: skill presort packing skipped: %s", exc)
+            continue
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2409,6 +2471,11 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Cheap-model skill pre-sort: filter the full skills index to a small,
+    # focused, relevant set per delegate and pack it into each task's context
+    # (Tier-2 pointer). Gated off by default; best-effort (never blocks).
+    _maybe_pack_presort_skills(task_list)
 
     overall_start = time.monotonic()
     results = []

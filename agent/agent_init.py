@@ -303,6 +303,13 @@ def init_agent(
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
+    # Lean worker prompt: when True, the stable identity tier is trimmed to a
+    # minimal identity with NO Hermes-brain tool guidance (memory/skills/
+    # session_search/skill_view) and NO skills index. Set for cursor-native
+    # delegate leaves, whose execution plane is Cursor built-ins (tool_choice:
+    # "none") — referencing Hermes tools they cannot call only misleads them.
+    # See tools/delegate_tool.py (native-leaf flip) + agent/system_prompt.py.
+    agent.lean_worker_prompt = False
     agent.pass_session_id = pass_session_id
     agent._credential_pool = credential_pool
     agent.log_prefix_chars = log_prefix_chars

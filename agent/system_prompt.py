@@ -144,6 +144,19 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if isinstance(_cc_len, int) and _cc_len > 0:
             _ctx_len = _cc_len
 
+    # Lean worker prompt (cursor-native delegate leaf). When set, the worker's
+    # execution plane is Cursor built-ins (tool_choice:"none") — it has no
+    # `hermes-tools` MCP and no customTools bridge, so the Hermes-brain tools
+    # (memory, skill_view, skill_manage, session_search) are present in
+    # ``valid_tool_names`` but UNCALLABLE. Emitting their guidance, the skills
+    # index, or the `skill_view` help pointer only misleads the worker. Trim the
+    # stable tier to a minimal identity + generic execution guidance. SOUL,
+    # context files (AGENTS.md / .cursor/rules /.mdc / contract), and memory are
+    # already suppressed for delegate children via load_soul_identity=False +
+    # skip_context_files=True + skip_memory=True. Flag is stable for the agent's
+    # life, so it does not threaten prompt caching.
+    _lean_worker = bool(getattr(agent, "lean_worker_prompt", False))
+
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
@@ -162,7 +175,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    # Skipped for lean workers: it instructs `skill_view(name='hermes-agent')`,
+    # a tool a native leaf cannot call.
+    if not _lean_worker:
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -184,14 +200,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
 
-    # Tool-aware behavioral guidance: only inject when the tools are loaded
+    # Tool-aware behavioral guidance: only inject when the tools are loaded.
+    # The memory / session_search / skills blocks reference Hermes-brain tools;
+    # a lean worker (native leaf) has them in valid_tool_names but cannot call
+    # them (tool_choice:"none"), so skip that guidance to avoid misleading it.
     tool_guidance = []
-    if "memory" in agent.valid_tool_names:
-        tool_guidance.append(MEMORY_GUIDANCE)
-    if "session_search" in agent.valid_tool_names:
-        tool_guidance.append(SESSION_SEARCH_GUIDANCE)
-    if "skill_manage" in agent.valid_tool_names:
-        tool_guidance.append(SKILLS_GUIDANCE)
+    if not _lean_worker:
+        if "memory" in agent.valid_tool_names:
+            tool_guidance.append(MEMORY_GUIDANCE)
+        if "session_search" in agent.valid_tool_names:
+            tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+        if "skill_manage" in agent.valid_tool_names:
+            tool_guidance.append(SKILLS_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
@@ -216,7 +236,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         from agent.prompt_builder import COMPUTER_USE_GUIDANCE
         stable_parts.append(COMPUTER_USE_GUIDANCE)
 
-    nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
+    nous_subscription_prompt = (
+        "" if _lean_worker
+        else _r.build_nous_subscription_prompt(agent.valid_tool_names)
+    )
     if nous_subscription_prompt:
         stable_parts.append(nous_subscription_prompt)
     # Tool-use enforcement: tells the model to actually call tools instead
@@ -255,7 +278,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-    has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+    # Skills index ("## Available Hermes skills"): a lean worker cannot call
+    # skill_view/skills_list, so the index is dead weight that misleads it into
+    # thinking it can load skills via tools (it must Read SKILL.md paths instead).
+    has_skills_tools = (not _lean_worker) and any(
+        name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage']
+    )
     if has_skills_tools:
         avail_toolsets = {
             toolset

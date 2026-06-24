@@ -2654,6 +2654,117 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         )
         self.assertNotIn("Worker housekeeping", prompt)
 
+    # ── Contract is IDE-only: never injected into proxy workers ───────────
+
+    @patch("tools.delegate_tool._get_max_spawn_depth", return_value=2)
+    @patch("run_agent.AIAgent")
+    def test_orchestrator_stays_client_mode_on_cursor_proxy(
+        self, MockAgent, _mock_depth
+    ):
+        """Orchestrator children stay in client mode so delegate_task remains available."""
+        mock_child = MagicMock()
+        mock_child.request_overrides = {
+            "extra_body": {"cursor_tool_mode": "client"},
+        }
+        mock_child.ephemeral_system_prompt = ""
+        MockAgent.return_value = mock_child
+        parent = _make_mock_parent(depth=0)
+        parent.request_overrides = {
+            "extra_body": {"cursor_tool_mode": "client"},
+        }
+
+        _build_child_agent(
+            0, "Survey approaches", None, None, None, 50, 1, parent,
+            role="orchestrator",
+        )
+
+        extra = mock_child.request_overrides["extra_body"]
+        self.assertEqual(extra.get("cursor_tool_mode"), "client")
+        self.assertNotIn("tool_choice", extra)
+        self.assertNotEqual(mock_child.__dict__.get("_cursor_native_leaf"), True)
+        self.assertEqual(mock_child._delegate_role, "orchestrator")
+
+    @patch("run_agent.AIAgent")
+    def test_leaf_flips_to_native_on_cursor_proxy(self, MockAgent):
+        """Leaf children on the cursor proxy are flipped to native SDK tool mode."""
+        mock_child = MagicMock()
+        mock_child.request_overrides = {
+            "extra_body": {"cursor_tool_mode": "client"},
+        }
+        mock_child.ephemeral_system_prompt = ""
+        MockAgent.return_value = mock_child
+        parent = _make_mock_parent(depth=0)
+        parent.request_overrides = {
+            "extra_body": {"cursor_tool_mode": "client"},
+        }
+
+        _build_child_agent(
+            0, "Fix tests", None, None, None, 50, 1, parent,
+        )
+
+        extra = mock_child.request_overrides["extra_body"]
+        self.assertEqual(extra.get("cursor_tool_mode"), "native")
+        self.assertEqual(extra.get("tool_choice"), "none")
+        self.assertTrue(getattr(mock_child, "_cursor_native_leaf", False))
+
+    @patch("run_agent.AIAgent")
+    def test_native_leaf_gets_no_contract_injection(self, MockAgent):
+        """A cursor-native leaf system prompt carries NO Hermes contract block:
+        the contract is an IDE-only artifact, never folded into proxy workers."""
+        mock_child = MagicMock()
+        mock_child.request_overrides = {
+            "extra_body": {"cursor_tool_mode": "client"},
+        }
+        mock_child.ephemeral_system_prompt = ""
+        MockAgent.return_value = mock_child
+        parent = _make_mock_parent(depth=0)
+        parent.request_overrides = {
+            "extra_body": {"cursor_tool_mode": "client"},
+        }
+
+        _build_child_agent(
+            0, "Fix tests", None, None, None, 50, 1, parent,
+        )
+
+        prompt = mock_child.ephemeral_system_prompt
+        self.assertNotIn("# Hermes contract", prompt)
+        self.assertNotIn("check before you act (not optional)", prompt)
+        self.assertNotIn("Available Hermes skills", prompt)
+        self.assertTrue(getattr(mock_child, "_cursor_native_leaf", False))
+
+    @patch("run_agent.AIAgent")
+    def test_native_leaf_no_contract_regardless_of_cwd(self, MockAgent):
+        """No contract is injected even for a Hermes-infra cwd (no scope path)."""
+        mock_child = MagicMock()
+        mock_child.request_overrides = {
+            "extra_body": {"cursor_tool_mode": "client"},
+        }
+        mock_child.ephemeral_system_prompt = ""
+        MockAgent.return_value = mock_child
+        parent = _make_mock_parent(depth=0)
+        parent.request_overrides = {
+            "extra_body": {"cursor_tool_mode": "client"},
+        }
+
+        _build_child_agent(
+            0, "Edit a Hermes skill", None, None, None, 50, 1, parent,
+            cwd="/Users/jarvis/hermes/.hermes/skills",
+        )
+
+        prompt = mock_child.ephemeral_system_prompt
+        self.assertNotIn("# Hermes contract", prompt)
+        self.assertNotIn("Available Hermes skills", prompt)
+        self.assertTrue(getattr(mock_child, "_cursor_native_leaf", False))
+
+    def test_schema_has_no_skills_param(self):
+        """The vestigial contract-narrowing 'skills' param is gone from the schema
+        (top level and per-task) — skill delivery is a task-scoped pointer in
+        `context`, not an injected, narrowable skill index."""
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertNotIn("skills", props)
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertNotIn("skills", task_props)
+
     # ── Batch mode and intersection ─────────────────────────────────────
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
