@@ -543,7 +543,7 @@ class TestBuildSkillsSystemPrompt:
         from unittest.mock import patch
 
         with patch(
-            "agent.prompt_builder.get_disabled_skill_names",
+            "agent.skills_index.get_disabled_skill_names",
             return_value={"old-tool"},
         ):
             result = build_skills_system_prompt()
