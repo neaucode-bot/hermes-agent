@@ -28,6 +28,7 @@ through the board.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -37,6 +38,11 @@ from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
+
+# Runtime enabled_toolsets contextvar for agent sessions
+_runtime_enabled_toolsets: contextvars.ContextVar[Optional[list[str]]] = (
+    contextvars.ContextVar("runtime_enabled_toolsets", default=None)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +71,8 @@ def _check_kanban_mode() -> bool:
 
     1. ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), OR
     2. The current profile has ``kanban`` in its toolsets config
-       (orchestrator profiles like techlead that route work via Kanban).
+       (orchestrator profiles like techlead that route work via Kanban), OR
+    3. The agent's runtime ``enabled_toolsets`` contains ``"kanban"``.
 
     Humans running ``hermes chat`` without the kanban toolset see zero
     kanban tools. Workers spawned by the kanban dispatcher (gateway-
@@ -74,7 +81,13 @@ def _check_kanban_mode() -> bool:
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return True
-    return _profile_has_kanban_toolset()
+    if _profile_has_kanban_toolset():
+        return True
+    # Check runtime enabled_toolsets from agent context
+    runtime_toolsets = _runtime_enabled_toolsets.get()
+    if runtime_toolsets and "kanban" in runtime_toolsets:
+        return True
+    return False
 
 
 def _check_kanban_orchestrator_mode() -> bool:
@@ -84,11 +97,18 @@ def _check_kanban_orchestrator_mode() -> bool:
     Dispatcher-spawned workers should close their own task via the
     lifecycle tools (complete/block/heartbeat), not enumerate or unblock
     board state. Profiles that explicitly opt into the kanban toolset
-    and are NOT scoped to a single task are the orchestrator surface.
+    (via config or runtime enabled_toolsets) and are NOT scoped to a
+    single task are the orchestrator surface.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
-    return _profile_has_kanban_toolset()
+    if _profile_has_kanban_toolset():
+        return True
+    # Check runtime enabled_toolsets from agent context
+    runtime_toolsets = _runtime_enabled_toolsets.get()
+    if runtime_toolsets and "kanban" in runtime_toolsets:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------

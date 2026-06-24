@@ -354,6 +354,13 @@ def _compute_tool_definitions(
     skip_tool_search_assembly: bool = False,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
+    # Set runtime enabled_toolsets for tool check functions
+    try:
+        from tools.kanban_tools import _runtime_enabled_toolsets
+        _runtime_enabled_toolsets.set(enabled_toolsets)
+    except Exception:
+        pass  # Fail silently if contextvar is unavailable
+    
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
@@ -913,6 +920,13 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    # Set runtime enabled_toolsets for tool check functions
+    try:
+        from tools.kanban_tools import _runtime_enabled_toolsets
+        _runtime_enabled_toolsets.set(enabled_toolsets)
+    except Exception:
+        pass  # Fail silently if contextvar is unavailable
+    
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
