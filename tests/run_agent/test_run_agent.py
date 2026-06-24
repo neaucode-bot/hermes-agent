@@ -3496,7 +3496,15 @@ class TestRunConversation:
         ]
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
-        assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
+        # The user's message is present in the request; its content may carry
+        # the tail-pinned steering reminder folded onto it (see agent/steering.py),
+        # so assert the original text is contained rather than an exact match.
+        assert any(
+            msg.get("role") == "user"
+            and isinstance(msg.get("content"), str)
+            and "search something" in msg["content"]
+            for msg in pre_request_calls[0]["request_messages"]
+        )
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 

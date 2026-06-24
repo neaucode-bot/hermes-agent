@@ -782,6 +782,23 @@ def run_conversation(
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
+        # ── Tail-pinned steering reminder (the true tail-reminder slot) ───
+        # Re-emit a short steering reminder AFTER the conversation history /
+        # current turn, every turn — Cursor's <system_reminder> analog.
+        # This is the cache-correct location: it sits PAST the cached head
+        # prefix, so the byte-stable head ``system`` message is never mutated
+        # and the upstream prefix cache + Anthropic cache_control breakpoints
+        # (applied just below) stay warm. We fold the reminder onto the last
+        # (already per-turn-volatile) ``user``/``tool`` message rather than
+        # appending a trailing ``system`` message, because native-Anthropic /
+        # Bedrock adapters keep only the LAST system message as the top-level
+        # system param and would otherwise drop the real head prompt. The
+        # ``agent.tail_steer`` hook lets callers replace the default text
+        # (e.g. fold in a per-turn skill shortlist). See agent/steering.py.
+        from agent.steering import DEFAULT_TAIL_STEER, inject_tail_steer
+        _tail_steer = getattr(agent, "tail_steer", None) or DEFAULT_TAIL_STEER
+        api_messages = inject_tail_steer(api_messages, _tail_steer)
+
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
         # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
