@@ -40,6 +40,7 @@ const { waitForDashboardPort } = require('./backend-ready.cjs')
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
 const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-marketplace.cjs')
 const { buildDesktopBackendEnv, normalizeHermesHomeRoot } = require('./backend-env.cjs')
+const { readMacosLaunchctlEnvVar } = require('./macos-launchctl-env.cjs')
 const { readWindowsUserEnvVar } = require('./windows-user-env.cjs')
 const { readDirForIpc } = require('./fs-read-dir.cjs')
 const { gitRootForIpc } = require('./git-root.cjs')
@@ -263,6 +264,17 @@ function resolveHermesHome() {
     // ~/.hermes setup (no LOCALAPPDATA install yet) so users don't lose state.
     if (!directoryExists(localappdata) && directoryExists(legacy)) return legacy
     return localappdata
+  }
+  if (IS_MAC) {
+    // A GUI app launched from Finder/Dock inherits the environment block
+    // captured at login, so HERMES_HOME set via launchctl setenv (e.g. in
+    // ai.hermes.env.plist) after login is invisible in process.env even though
+    // the CLI (a fresh shell) sees it. Without this the backend silently falls
+    // back to ~/.hermes and shows the first-run bootstrap installer despite a
+    // valid configured home. Consult the live launchd user-domain value before
+    // the default below.
+    const fromLaunchctl = readMacosLaunchctlEnvVar('HERMES_HOME')
+    if (fromLaunchctl) return normalizeHermesHomeRoot(fromLaunchctl)
   }
   return path.join(app.getPath('home'), '.hermes')
 }
