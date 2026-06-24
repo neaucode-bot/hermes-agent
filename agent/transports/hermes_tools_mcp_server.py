@@ -92,59 +92,36 @@ logger = logging.getLogger(__name__)
 # TUI/gateway path where this env var is not set.
 _CURSOR_MODE: bool = os.environ.get("HERMES_CURSOR_MODE", "") == "1"
 
-# Hermes browser_* tools — exposed in gateway/TUI mode, suppressed in
-# Cursor IDE mode (cursor-ide-browser covers that lane).
-_HERMES_BROWSER_TOOLS: tuple[str, ...] = (
-    "browser_navigate",
-    "browser_click",
-    "browser_type",
-    "browser_press",
-    "browser_snapshot",
-    "browser_scroll",
-    "browser_back",
-    "browser_get_images",
-    "browser_console",
-    "browser_vision",
+# The exposed tool surface is DERIVED from the canonical role-tagged manifest
+# in ``agent.hermes_tool_surface`` (the single source of truth shared with the
+# proxy/orchestrator side). The lists below are byte-equivalent to the previous
+# hand-written tuples — see that module for the per-tool rationale, the
+# intentional exclusions (delegate_task / todo / terminal / file / search), and
+# the role tags.
+#
+# ``EXPOSED_TOOLS``  = registry-dispatched IDE tools (filters role ⊇ {ide},
+#                      dispatch == "registry"). browser_* tools are suppressed
+#                      when HERMES_CURSOR_MODE=1, exactly as before.
+# ``_DIRECT_TOOL_NAMES`` = direct-dispatch IDE orchestration tools
+#                      (send_message, memory, session_search).
+from agent.hermes_tool_surface import (
+    ide_direct_tools as _surface_ide_direct_tools,
+    ide_registry_tools as _surface_ide_registry_tools,
 )
 
-EXPOSED_TOOLS: tuple[str, ...] = (
-    "web_search",
-    "web_extract",
-    *(() if _CURSOR_MODE else _HERMES_BROWSER_TOOLS),
-    "vision_analyze",
-    "image_generate",
-    "skill_view",
-    "skills_list",
-    # skill_manage — create/edit/patch/delete Hermes skills. Stateless
-    # (file I/O under ~/.hermes/skills/) and NOT in `_AGENT_LOOP_TOOLS`, so
-    # the registry path dispatches it fine; routing it here (rather than via
-    # DIRECT_TOOLS) means handle_function_call() applies the full middleware
-    # stack — tool_request middleware, pre/post plugin hooks, edit approval,
-    # the skill write-approval gate, and transform_tool_result — exactly like
-    # any other registry tool. Lets a Cursor orchestrator manage skills
-    # without shelling into the Hermes venv.
-    "skill_manage",
-    "text_to_speech",
-    # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
-    # (set by the kanban dispatcher when spawning a worker). Without these
-    # in the callback, a worker spawned with openai_runtime=codex_app_server
-    # could do the work but couldn't report completion back to the kernel,
-    # making it hang until timeout. Stateless dispatch — they just read
-    # the env var and write to ~/.hermes/kanban.db.
-    "kanban_complete",
-    "kanban_block",
-    "kanban_comment",
-    "kanban_heartbeat",
-    "kanban_show",
-    "kanban_list",
-    # NOTE: kanban_create / kanban_unblock / kanban_link are orchestrator-
-    # only — the kanban tool gates them on HERMES_KANBAN_TASK being unset.
-    # They're exposed here for orchestrator agents running on the codex
-    # runtime that need to dispatch new tasks.
-    "kanban_create",
-    "kanban_unblock",
-    "kanban_link",
+# Hermes browser_* tools — exposed in gateway/TUI mode, suppressed in Cursor
+# IDE mode (cursor-ide-browser covers that lane). Derived from the manifest's
+# ``cursor_suppressed`` flag; kept as a module constant for back-compat.
+_HERMES_BROWSER_TOOLS: tuple[str, ...] = tuple(
+    name
+    for name in _surface_ide_registry_tools(cursor_mode=False)
+    if name not in _surface_ide_registry_tools(cursor_mode=True)
 )
+
+EXPOSED_TOOLS: tuple[str, ...] = _surface_ide_registry_tools(cursor_mode=_CURSOR_MODE)
+
+# Direct-dispatch orchestration tool names (handlers built in _direct_tools()).
+_DIRECT_TOOL_NAMES: tuple[str, ...] = _surface_ide_direct_tools()
 
 
 def _direct_tools() -> dict[str, tuple[str, Any]]:
@@ -198,11 +175,15 @@ def _direct_tools() -> dict[str, tuple[str, Any]]:
             profile=args.get("profile"),
         )
 
-    return {
+    # Membership + order are driven by the canonical manifest
+    # (``_DIRECT_TOOL_NAMES``); the bespoke handlers below stay here because
+    # each builds the minimal stateless context its tool needs.
+    handlers: dict[str, tuple[str, Any]] = {
         "send_message": (SEND_MESSAGE_SCHEMA["description"], _dispatch_send_message),
         "memory": (MEMORY_SCHEMA["description"], _dispatch_memory),
         "session_search": (SESSION_SEARCH_SCHEMA["description"], _dispatch_session_search),
     }
+    return {name: handlers[name] for name in _DIRECT_TOOL_NAMES if name in handlers}
 
 
 def _redact_tool_output(result: Any) -> Any:
